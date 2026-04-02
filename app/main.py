@@ -53,7 +53,10 @@ def _df_to_appliances(df: pd.DataFrame) -> list[dict]:
         if not name:
             continue
         start_time = str(r.get("start_time", "")).strip() or None
-        end_time = str(r.get("end_time", "")).strip() or None
+end_time = str(r.get("end_time", "")).strip() or None
+
+if start_time == "24:00":
+    start_time = "00:00"
         can_shift = r.get("can_shift", False)
         if isinstance(can_shift, str):
             can_shift = can_shift.lower() in ("true", "1", "yes", "y")
@@ -252,7 +255,7 @@ if page == "setup":
             max_power = st.number_input("Max Power (kW)", 0.0, 10000.0, default_max_power)
 
         st.subheader("⚙️ Appliances")
-        st.caption("Add/edit appliances. Use HH:MM 24h format or leave empty.")
+        st.caption("Add/edit appliances. Use HH:MM 24h format or leave empty. Midnight start should be 00:00; end time may be 24:00.")
         edited_df = st.data_editor(
             default_apps_df,
             num_rows="dynamic",
