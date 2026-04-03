@@ -1,6 +1,6 @@
-# app/main.py
 import os
 import json
+import altair as alt
 import streamlit as st
 import pandas as pd
 from datetime import date
@@ -39,10 +39,12 @@ def safe_float(value, default=0.0):
     except (TypeError, ValueError):
         return float(default)
 
+
 def _as_appliance_rows(appliances: list[dict]) -> pd.DataFrame:
     if not appliances:
         appliances = []
     return pd.DataFrame(appliances, columns=["name", "start_time", "end_time", "can_shift"]).fillna("")
+
 
 def _df_to_appliances(df: pd.DataFrame) -> list[dict]:
     rows = []
@@ -74,6 +76,217 @@ def _df_to_appliances(df: pd.DataFrame) -> list[dict]:
         )
 
     return rows
+
+
+def _hour_labels(n: int = 24) -> list[str]:
+    return [f"{h:02d}:00" for h in range(n)]
+
+
+def build_pv_forecast_chart(pv_forecast: list[float]):
+    pv = (pv_forecast or [])[:24]
+    time_labels = _hour_labels(len(pv))
+    df = pd.DataFrame(
+        {
+            "Time": time_labels,
+            "PV Forecast (kWh)": [round(float(x or 0.0), 3) for x in pv],
+        }
+    )
+
+    return (
+        alt.Chart(df)
+        .mark_area(line=True, opacity=0.22)
+        .encode(
+            x=alt.X("Time:N", sort=time_labels, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("PV Forecast (kWh):Q", title="PV Forecast (kWh)"),
+            tooltip=[
+                alt.Tooltip("Time:N"),
+                alt.Tooltip("PV Forecast (kWh):Q", format=".3f"),
+            ],
+        )
+        .properties(height=320)
+        .interactive()
+    )
+
+
+def build_schedule_heatmap(schedule: dict):
+    time_labels = _hour_labels()
+    records = []
+
+    for app, values in (schedule or {}).items():
+        values = (values or [])[:24]
+        for h, raw in enumerate(values):
+            level = float(raw or 0.0)
+            records.append(
+                {
+                    "Appliance": app,
+                    "Time": time_labels[h],
+                    "Hour": h,
+                    "Level": round(level, 2),
+                    "State": "Running" if level > 0.01 else "Idle",
+                }
+            )
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return alt.Chart(pd.DataFrame({"Message": ["No schedule data available"]})).mark_text(size=14).encode(
+            text="Message:N"
+        )
+
+    app_order = list((schedule or {}).keys())
+
+    return (
+        alt.Chart(df)
+        .mark_rect(stroke="white", strokeWidth=1)
+        .encode(
+            x=alt.X(
+                "Time:N",
+                sort=time_labels,
+                title=None,
+                axis=alt.Axis(labelAngle=0, labelOverlap=False, tickSize=0),
+            ),
+            y=alt.Y("Appliance:N", sort=app_order, title=None),
+            color=alt.Color(
+                "State:N",
+                scale=alt.Scale(
+                    domain=["Idle", "Running"],
+                    range=["#e2e8f0", "#4f46e5"],
+                ),
+                legend=alt.Legend(title="Appliance state", orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("Appliance:N"),
+                alt.Tooltip("Time:N"),
+                alt.Tooltip("State:N"),
+                alt.Tooltip("Level:Q", title="Power / level", format=".2f"),
+            ],
+        )
+        .properties(height=max(240, 42 * len(app_order)))
+        .interactive()
+    )
+
+
+def build_temperature_chart(results: dict, params: dict):
+    time_labels = _hour_labels()
+    indoor = (results.get("temps") or [0] * 24)[:24]
+    outdoor = (results.get("T_ext") or [None] * 24)[:24]
+
+    df = pd.DataFrame(
+        {
+            "Time": time_labels,
+            "Indoor Temp (°C)": [round(float(x or 0.0), 2) for x in indoor],
+            "Comfort Min (°C)": [float(params.get("Tmin", 18.0))] * 24,
+            "Comfort Max (°C)": [float(params.get("Tmax", 22.0))] * 24,
+            "Outdoor Temp (°C)": [
+                None if x is None else round(float(x), 2) for x in outdoor
+            ],
+        }
+    )
+
+    band = (
+        alt.Chart(df)
+        .mark_area(opacity=0.18)
+        .encode(
+            x=alt.X("Time:N", sort=time_labels, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Comfort Min (°C):Q", title="Temperature (°C)"),
+            y2="Comfort Max (°C):Q",
+            tooltip=[
+                alt.Tooltip("Time:N"),
+                alt.Tooltip("Comfort Min (°C):Q", format=".1f"),
+                alt.Tooltip("Comfort Max (°C):Q", format=".1f"),
+            ],
+        )
+    )
+
+    indoor_line = (
+        alt.Chart(df)
+        .mark_line(point=True, strokeWidth=3)
+        .encode(
+            x=alt.X("Time:N", sort=time_labels, title=None),
+            y=alt.Y("Indoor Temp (°C):Q", title="Temperature (°C)"),
+            color=alt.value("#2563eb"),
+            tooltip=[
+                alt.Tooltip("Time:N"),
+                alt.Tooltip("Indoor Temp (°C):Q", format=".2f"),
+            ],
+        )
+    )
+
+    chart = band + indoor_line
+
+    if df["Outdoor Temp (°C)"].notna().any():
+        outdoor_line = (
+            alt.Chart(df)
+            .mark_line(point=False, strokeDash=[6, 4], strokeWidth=2)
+            .encode(
+                x=alt.X("Time:N", sort=time_labels, title=None),
+                y=alt.Y("Outdoor Temp (°C):Q", title="Temperature (°C)"),
+                color=alt.value("#f59e0b"),
+                tooltip=[
+                    alt.Tooltip("Time:N"),
+                    alt.Tooltip("Outdoor Temp (°C):Q", format=".2f"),
+                ],
+            )
+        )
+        chart = chart + outdoor_line
+
+    return chart.properties(height=360).interactive()
+
+
+def build_energy_flow_chart(results: dict, params: dict):
+    time_labels = _hour_labels()
+
+    grid_import = [round(float(x or 0.0), 3) for x in (results.get("grid_import") or [0] * 24)[:24]]
+    grid_export = [round(float(x or 0.0), 3) for x in (results.get("grid_export") or [0] * 24)[:24]]
+    pv = [round(float(x or 0.0), 3) for x in (params.get("pv_forecast") or [0] * 24)[:24]]
+
+    flow_rows = []
+    for i, time_label in enumerate(time_labels):
+        flow_rows.append({"Time": time_label, "Series": "Grid Import", "Value": grid_import[i]})
+        flow_rows.append({"Time": time_label, "Series": "Grid Export", "Value": -grid_export[i]})
+
+    flow_df = pd.DataFrame(flow_rows)
+    pv_df = pd.DataFrame({"Time": time_labels, "PV Forecast": pv})
+
+    zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4]).encode(y="y:Q")
+
+    bars = (
+        alt.Chart(flow_df)
+        .mark_bar(size=16)
+        .encode(
+            x=alt.X("Time:N", sort=time_labels, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Value:Q", title="Power / energy by hour"),
+            color=alt.Color(
+                "Series:N",
+                scale=alt.Scale(
+                    domain=["Grid Import", "Grid Export"],
+                    range=["#2563eb", "#f97316"],
+                ),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("Time:N"),
+                alt.Tooltip("Series:N"),
+                alt.Tooltip("Value:Q", format=".3f"),
+            ],
+        )
+    )
+
+    pv_line = (
+        alt.Chart(pv_df)
+        .mark_line(point=True, strokeWidth=3)
+        .encode(
+            x=alt.X("Time:N", sort=time_labels, title=None),
+            y=alt.Y("PV Forecast:Q", title="Power / energy by hour"),
+            color=alt.value("#16a34a"),
+            tooltip=[
+                alt.Tooltip("Time:N"),
+                alt.Tooltip("PV Forecast:Q", format=".3f"),
+            ],
+        )
+    )
+
+    return alt.layer(zero_rule, bars, pv_line).properties(height=380).interactive()
+
 
 def _summarize_for_assistant(params: dict) -> dict:
     """
@@ -129,14 +342,18 @@ def _summarize_for_assistant(params: dict) -> dict:
         "optimization": opt_summary,
     }
 
+
 def _is_context_msg(m: dict) -> bool:
     return m.get("role") == "system" and str(m.get("content", "")).startswith("SYSTEM_CONTEXT_JSON:")
+
 
 def _latest_context_message(params: dict) -> dict:
     context = _summarize_for_assistant(params)
     try:
         if isinstance(context.get("forecast", {}).get("pv_forecast_24h_kwh"), list):
-            context["forecast"]["pv_forecast_24h_kwh"] = [round(float(x), 3) for x in context["forecast"]["pv_forecast_24h_kwh"][:24]]
+            context["forecast"]["pv_forecast_24h_kwh"] = [
+                round(float(x), 3) for x in context["forecast"]["pv_forecast_24h_kwh"][:24]
+            ]
     except Exception:
         pass
 
@@ -162,6 +379,7 @@ def _assistant_system_prompt() -> str:
         "- Never ask for or reveal API keys.\n"
     )
 
+
 # ---------- Init DB ----------
 init_db()
 
@@ -179,7 +397,7 @@ pages = {
     "🔮 Forecast PV": "forecast",
     "⚙️ Optimize Schedule": "optimize",
     "📊 View Results": "results",
-    "🤖 Assistant": "assistant",  
+    "🤖 Assistant": "assistant",
 }
 
 if "active_page" not in st.session_state:
@@ -189,8 +407,8 @@ latest = load_latest_parameters()
 has_params = bool(latest)
 
 for name, key in pages.items():
-    disabled = (key != "setup" and not has_params)
-    if st.sidebar.button(name, width='stretch', disabled=disabled):
+    disabled = key != "setup" and not has_params
+    if st.sidebar.button(name, width="stretch", disabled=disabled):
         st.session_state.active_page = key
 
 if not has_params:
@@ -260,11 +478,14 @@ if page == "setup":
             max_power = st.number_input("Max Power (kW)", 0.0, 10000.0, default_max_power)
 
         st.subheader("⚙️ Appliances")
-        st.caption("Add/edit appliances. Use HH:MM 24h format or leave empty. Midnight start should be 00:00; end time may be 24:00.")
+        st.caption(
+            "Add/edit appliances. Use HH:MM 24h format or leave empty. "
+            "Midnight start should be 00:00; end time may be 24:00."
+        )
         edited_df = st.data_editor(
             default_apps_df,
             num_rows="dynamic",
-            width='stretch',
+            width="stretch",
             column_config={
                 "name": st.column_config.TextColumn("Name", required=True),
                 "start_time": st.column_config.TextColumn("Start (HH:MM)", required=False),
@@ -350,7 +571,7 @@ elif page == "forecast":
                 try:
                     df_full, X, y = load_pvgis_for_lstm(pvgis_csv_path)
                     st.subheader("📊 Processed sample")
-                    st.dataframe(df_full[["pv_output_kwh", "G_i", "H_sun", "T2m"]].head(), width='stretch')
+                    st.dataframe(df_full[["pv_output_kwh", "G_i", "H_sun", "T2m"]].head(), width="stretch")
 
                     if st.button("🔮 Generate Forecast (LSTM)"):
                         capacity = safe_float(params.get("solar_pv_capacity"), 1.0) or 1.0
@@ -361,7 +582,7 @@ elif page == "forecast":
                         params["forecast_source"] = "pvgis_lstm"
                         overwrite_latest_parameters(params)
 
-                        st.line_chart(pv_forecast)
+                        st.altair_chart(build_pv_forecast_chart(pv_forecast), use_container_width=True)
                         st.subheader("📏 Validation Metrics")
                         if metrics.get("error"):
                             st.error(metrics["error"])
@@ -397,7 +618,6 @@ elif page == "forecast":
                 else:
                     try:
                         lat, lon, resolved = geocode_city(city=city, api_key=api_key)
-                        from forecasting.openweather_pv_forecast import fetch_forecast25_hourly
 
                         try:
                             hourly = fetch_forecast25_hourly(lat=lat, lon=lon, api_key=api_key)
@@ -421,7 +641,6 @@ elif page == "forecast":
 
                         params["pv_forecast"] = pv_24h
                         params["forecast_source"] = f"openweather_{source_note}"
-
                         params["forecast_metrics"] = {"note": "clear-sky shape + clouds + temp derate + PR"}
                         params["weather_hourly"] = {
                             "resolved": resolved,
@@ -432,7 +651,7 @@ elif page == "forecast":
                         overwrite_latest_parameters(params)
 
                         st.success(f"✅ Forecast saved (city resolved: {resolved})")
-                        st.line_chart(pv_24h)
+                        st.altair_chart(build_pv_forecast_chart(pv_24h), use_container_width=True)
 
                     except OpenWeatherError as e:
                         st.error(f"OpenWeather error: {e}")
@@ -471,6 +690,7 @@ elif page == "optimize":
                 T_ext=T_ext,
                 feed_in_tariff=feed_in_tariff,
             )
+            results["T_ext"] = T_ext
             params["optimization_results"] = results
             overwrite_latest_parameters(params)
             st.success("✅ Optimization complete! Go to Results.")
@@ -486,40 +706,23 @@ elif page == "results":
     else:
         st.header("📊 Optimization Results")
 
+        grid_import = results.get("grid_import") or []
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Cost", f"${results['cost']:.2f}")
-        col2.metric("Peak Import", f"{max(results['grid_import']):.2f} kW")
-        col3.metric("Total Import Energy", f"{sum(results['grid_import']):.2f} kWh")
+        col1.metric("Total Cost", f"${safe_float(results.get('cost'), 0.0):.2f}")
+        col2.metric("Peak Import", f"{max(grid_import) if grid_import else 0.0:.2f} kW")
+        col3.metric("Total Import Energy", f"{sum(grid_import) if grid_import else 0.0:.2f} kWh")
 
         st.subheader("Appliance Schedules")
-        hours = list(range(24))
-        schedule_df = pd.DataFrame(
-            {app: results["schedule"][app] for app in results["schedule"]},
-            index=[f"{h}:00" for h in hours],
-        )
-        st.bar_chart(schedule_df, height=400)
+        st.caption("Heatmap view makes operating windows easier to read than grouped bars.")
+        st.altair_chart(build_schedule_heatmap(results.get("schedule", {})), use_container_width=True)
 
-        st.subheader("Indoor Temperatures")
-        temp_df = pd.DataFrame(
-            {
-                "Indoor Temp (°C)": [round(t, 2) for t in results["temps"]],
-                "Tmin (°C)": [params["Tmin"]] * 24,
-                "Tmax (°C)": [params["Tmax"]] * 24,
-            },
-            index=[f"{h}:00" for h in hours],
-        )
-        st.line_chart(temp_df, height=400)
+        st.subheader("Indoor Temperature vs Comfort Band")
+        st.caption("Shows whether optimized indoor temperature stays inside your comfort limits.")
+        st.altair_chart(build_temperature_chart(results, params), use_container_width=True)
 
-        st.subheader("Grid Import/Export vs PV")
-        load_df = pd.DataFrame(
-            {
-                "Grid Import (kW)": [round(x, 3) for x in results["grid_import"]],
-                "Grid Export (kW)": [round(x, 3) for x in results["grid_export"]],
-                "PV (kWh)": [round(x, 3) for x in params["pv_forecast"]],
-            },
-            index=[f"{h}:00" for h in hours],
-        )
-        st.line_chart(load_df, height=400)
+        st.subheader("Grid Import / Export and PV Forecast")
+        st.caption("Imports are above zero, exports are below zero, and PV is overlaid as a line.")
+        st.altair_chart(build_energy_flow_chart(results, params), use_container_width=True)
 
 # ============================================================
 # 🤖 ASSISTANT PAGE (VectorEngine chat)
@@ -536,7 +739,6 @@ elif page == "assistant":
         if not key_present:
             st.error("Missing VECTORENGINE_API_KEY (or OPENAI_API_KEY). Add it to .env.")
         else:
-            # Initialize chat memory
             if "assistant_messages" not in st.session_state:
                 st.session_state.assistant_messages = [
                     {"role": "system", "content": _assistant_system_prompt()},
@@ -546,7 +748,7 @@ elif page == "assistant":
             colA, colB, _ = st.columns([1, 1, 2])
 
             with colA:
-                if st.button("🔄 Refresh Context", width='stretch'):
+                if st.button("🔄 Refresh Context", width="stretch"):
                     fresh = load_latest_parameters() or {}
                     new_context = _latest_context_message(fresh)
 
@@ -557,7 +759,7 @@ elif page == "assistant":
                     st.success("Context refreshed.")
 
             with colB:
-                if st.button("🧹 Clear Chat", width='stretch'):
+                if st.button("🧹 Clear Chat", width="stretch"):
                     st.session_state.assistant_messages = [
                         {"role": "system", "content": _assistant_system_prompt()},
                         _latest_context_message(load_latest_parameters() or {}),
@@ -566,11 +768,10 @@ elif page == "assistant":
 
             for m in st.session_state.assistant_messages:
                 if m["role"] == "system":
-                    continue  
+                    continue
                 with st.chat_message("user" if m["role"] == "user" else "assistant"):
                     st.markdown(m["content"])
 
-            # User input
             user_text = st.chat_input("Ask: Why is PV low at 8am? How can I reduce cost? Should I widen Tmax?")
             if user_text:
                 st.session_state.assistant_messages.append({"role": "user", "content": user_text})
@@ -593,14 +794,12 @@ elif page == "assistant":
 
                             st.markdown(answer)
                             st.session_state.assistant_messages.append({"role": "assistant", "content": answer})
-                            MAX_MSGS = 20
+
+                            max_msgs = 20
                             keep = [m for m in st.session_state.assistant_messages if m["role"] == "system"]
-                            rest = [m for m in st.session_state.assistant_messages if m["role"] != "system"][-MAX_MSGS:]
+                            rest = [m for m in st.session_state.assistant_messages if m["role"] != "system"][-max_msgs:]
                             st.session_state.assistant_messages = keep + rest
 
                         except Exception as e:
                             st.error("Assistant call failed.")
                             st.exception(e)
-                        except Exception as e:
-                            st.error(f"Unexpected error: {e}")
-
