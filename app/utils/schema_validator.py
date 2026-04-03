@@ -30,8 +30,8 @@ def _normalize_time(v, *, allow_2400: bool = False):
 
 class ApplianceSetting(BaseModel):
     name: str
-    start_time: Optional[str] = None  # "HH:MM"
-    end_time: Optional[str] = None    # "HH:MM"
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
     can_shift: Optional[bool] = False
 
     @validator("start_time")
@@ -60,7 +60,6 @@ class HEMSParameters(BaseModel):
     solar_pv_capacity: Optional[float] = 0.0
     pv_forecast: Optional[List[float]] = Field(default_factory=list)
 
-    # extra fields we keep in the stored payload (not required by the form)
     forecast_source: Optional[str] = None
     forecast_metrics: Optional[dict] = Field(default_factory=dict)
     weather_hourly: Optional[dict] = None
