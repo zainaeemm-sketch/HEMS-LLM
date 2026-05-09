@@ -2,6 +2,7 @@
 import pulp
 from utils.constants import TIME_SLOTS, TOU_PRICES
 
+
 def safe_float(value, default=0.0):
     try:
         if value is None or value == "":
@@ -9,6 +10,7 @@ def safe_float(value, default=0.0):
         return float(value)
     except (ValueError, TypeError):
         return float(default)
+
 
 def optimize_schedule(
     params: dict,
@@ -60,7 +62,9 @@ def optimize_schedule(
 
     prob = pulp.LpProblem("HEMS_Optimizer", pulp.LpMinimize)
 
-    heating_power = pulp.LpVariable.dicts("heating", range(TIME_SLOTS), lowBound=0, upBound=2.0)
+    heating_power = pulp.LpVariable.dicts(
+        "heating", range(TIME_SLOTS), lowBound=0, upBound=2.0
+    )
 
     app_on = {
         app: pulp.LpVariable.dicts(f"{app}_on", range(TIME_SLOTS), cat="Binary")
@@ -75,24 +79,35 @@ def optimize_schedule(
         "Dishwasher": 1.2,
         "Washing Machine": 0.8,
         "Dryer": 3.0,
+        "EV": 2.0,
     }
 
     total_load = []
     for t in range(TIME_SLOTS):
-        fixed = pulp.lpSum(app_on.get(app, {}).get(t, 0) * app_power.get(app, 1.0) for app in app_on)
+        fixed = pulp.lpSum(
+            app_on.get(app, {}).get(t, 0) * app_power.get(app, 1.0)
+            for app in app_on
+        )
         total_load.append(fixed + heating_power[t])
 
     net = [total_load[t] - pv_forecast[t] for t in range(TIME_SLOTS)]
 
-    grid_import = pulp.LpVariable.dicts("grid_import", range(TIME_SLOTS), lowBound=0)
-    grid_export = pulp.LpVariable.dicts("grid_export", range(TIME_SLOTS), lowBound=0)
+    grid_import = pulp.LpVariable.dicts(
+        "grid_import", range(TIME_SLOTS), lowBound=0
+    )
+    grid_export = pulp.LpVariable.dicts(
+        "grid_export", range(TIME_SLOTS), lowBound=0
+    )
 
     for t in range(TIME_SLOTS):
         prob += grid_import[t] >= net[t]
         prob += grid_export[t] >= -net[t]
 
     fit = max(0.0, safe_float(feed_in_tariff, 0.0))
-    prob += pulp.lpSum([grid_import[t] * tou_prices[t] - grid_export[t] * fit for t in range(TIME_SLOTS)])
+    prob += pulp.lpSum(
+        grid_import[t] * tou_prices[t] - grid_export[t] * fit
+        for t in range(TIME_SLOTS)
+    )
 
     for t in range(TIME_SLOTS):
         prob += total_load[t] <= max_power
@@ -107,19 +122,29 @@ def optimize_schedule(
                 start_h = int(str(setting["start_time"]).split(":")[0])
             except Exception:
                 start_h = 0
+
         if setting.get("end_time"):
             try:
                 end_h = int(str(setting["end_time"]).split(":")[0])
             except Exception:
                 end_h = 24
 
+        start_h = max(0, min(start_h, 23))
+        end_h = max(1, min(end_h, 24))
+
         can_shift = bool(setting.get("can_shift"))
 
         if can_shift:
+            for t in range(TIME_SLOTS):
+                if not (start_h <= t < end_h):
+                    prob += app_on[app][t] == 0
+
             prob += pulp.lpSum(app_on[app][t] for t in range(TIME_SLOTS)) == 2
         else:
             for t in range(TIME_SLOTS):
-                if not (start_h <= t < end_h):
+                if start_h <= t < end_h:
+                    prob += app_on[app][t] == 1
+                else:
                     prob += app_on[app][t] == 0
 
     # Thermal model (linear)
@@ -127,12 +152,22 @@ def optimize_schedule(
     alpha, beta = 0.10, 0.05
     prob += T[0] == 20.0
     for t in range(1, TIME_SLOTS):
-        prob += T[t] == T[t - 1] + alpha * heating_power[t - 1] - beta * (T[t - 1] - T_ext[t - 1])
+        prob += (
+            T[t]
+            == T[t - 1]
+            + alpha * heating_power[t - 1]
+            - beta * (T[t - 1] - T_ext[t - 1])
+        )
 
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    schedule = {app: [pulp.value(app_on[app][t]) for t in range(TIME_SLOTS)] for app in app_on}
-    schedule["Heating"] = [pulp.value(heating_power[t]) for t in range(TIME_SLOTS)]
+    schedule = {
+        app: [pulp.value(app_on[app][t]) for t in range(TIME_SLOTS)]
+        for app in app_on
+    }
+    schedule["Heating"] = [
+        pulp.value(heating_power[t]) for t in range(TIME_SLOTS)
+    ]
 
     temps = [pulp.value(T[t]) for t in range(TIME_SLOTS)]
     cost = float(pulp.value(prob.objective) or 0.0)
