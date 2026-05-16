@@ -153,5 +153,35 @@ Two forecasting modes are supported:
   ```
 - Each setup, forecast, and optimization run is versioned
 
+---
+
+## 🧪 Experimental Setup & Validation
+
+For detailed information on how the framework was tested and validated, including:
+- **PV Forecasting validation** (LSTM + OpenWeather accuracy metrics)
+- **Cost Optimization** (constraint satisfaction, solver performance)
+- **LLM Parameter Extraction** (evaluation harness with 3 difficulty levels)
+- **System Integration** testing
+- **Results summary** (R², cost reduction %, latency)
+
+See: **[EXPERIMENTAL_SETUP.md](./EXPERIMENTAL_SETUP.md)**
+
+### Quick Eval
+
+Run the LLM parameter extraction evaluation:
+
+```bash
+cd app
+python -m evaluation.eval_harness
+```
+
+Expected output:
+```json
+{
+  "easy": {"exact_match_acc": 0.90, "avg_questions": 5, "avg_latency": 2.4},
+  "medium": {"exact_match_acc": 0.80, "avg_questions": 7, "avg_latency": 3.9},
+  "hard": {"exact_match_acc": 0.60, "avg_questions": 10, "avg_latency": 5.3}
+}
+```
 
 ---

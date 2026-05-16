@@ -33,6 +33,7 @@ class ApplianceSetting(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     can_shift: Optional[bool] = False
+    duration_hours: Optional[int] = 1
 
     @validator("start_time")
     def validate_start_time(cls, v):
@@ -45,6 +46,18 @@ class ApplianceSetting(BaseModel):
     @validator("end_time")
     def validate_end_time(cls, v):
         return _normalize_time(v, allow_2400=True)
+
+    @validator("duration_hours", pre=True)
+    def validate_duration(cls, v):
+        if v in (None, ""):
+            return 1
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            raise ValueError("duration_hours must be an integer")
+        if not (1 <= n <= 24):
+            raise ValueError("duration_hours must be between 1 and 24")
+        return n
 
 
 class HEMSParameters(BaseModel):

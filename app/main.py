@@ -46,7 +46,7 @@ def _as_appliance_rows(appliances: list[dict]) -> pd.DataFrame:
         appliances = []
     return pd.DataFrame(
         appliances,
-        columns=["name", "start_time", "end_time", "can_shift"],
+        columns=["name", "start_time", "end_time", "can_shift", "duration_hours"],
     ).fillna("")
 
 
@@ -71,12 +71,20 @@ def _df_to_appliances(df: pd.DataFrame) -> list[dict]:
         if isinstance(can_shift, str):
             can_shift = can_shift.lower() in ("true", "1", "yes", "y")
 
+        raw_duration = r.get("duration_hours", 1)
+        try:
+            duration_hours = int(raw_duration) if str(raw_duration).strip() != "" else 1
+        except (TypeError, ValueError):
+            duration_hours = 1
+        duration_hours = max(1, min(duration_hours, 24))
+
         rows.append(
             {
                 "name": name,
                 "start_time": start_time,
                 "end_time": end_time,
                 "can_shift": bool(can_shift),
+                "duration_hours": duration_hours,
             }
         )
 
@@ -615,7 +623,8 @@ if page == "setup":
         st.subheader("⚙️ Appliances")
         st.caption(
             "Add/edit appliances. Use HH:MM 24h format or leave empty. "
-            "Midnight start should be 00:00; end time may be 24:00."
+            "Midnight start should be 00:00; end time may be 24:00. "
+            "Duration (h) is the operating time of one cycle (e.g. washing machine = 1, EV = 4)."
         )
         edited_df = st.data_editor(
             default_apps_df,
@@ -626,6 +635,14 @@ if page == "setup":
                 "start_time": st.column_config.TextColumn("Start (HH:MM)", required=False),
                 "end_time": st.column_config.TextColumn("End (HH:MM)", required=False),
                 "can_shift": st.column_config.CheckboxColumn("Can Shift?", default=False),
+                "duration_hours": st.column_config.NumberColumn(
+                    "Duration (h)",
+                    min_value=1,
+                    max_value=24,
+                    step=1,
+                    default=1,
+                    help="How many hours one full cycle of this appliance takes.",
+                ),
             },
         )
 
