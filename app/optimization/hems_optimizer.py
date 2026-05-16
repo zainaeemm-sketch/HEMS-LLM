@@ -168,23 +168,44 @@ def optimize_schedule(
                 app_start[s] for s in valid_starts if s <= t < s + duration
             )
 
-    # Thermal model (linear)
-    T = pulp.LpVariable.dicts("T", range(TIME_SLOTS), lowBound=Tmin, upBound=Tmax)
+    # Thermal model with SOFT comfort bounds.
+    # Hard min/max on T make the LP infeasible whenever heating capacity
+    # can't beat outdoor heat loss. Soft bounds use slack variables so
+    # violations are allowed but penalized in the objective.
+    T = pulp.LpVariable.dicts("T", range(TIME_SLOTS))  # unbounded
+    T_under = pulp.LpVariable.dicts("T_under", range(TIME_SLOTS), lowBound=0)
+    T_over = pulp.LpVariable.dicts("T_over", range(TIME_SLOTS), lowBound=0)
+
     alpha, beta = 0.10, 0.05
     prob += T[0] == 20.0
     for t in range(1, TIME_SLOTS):
         prob += T[t] == T[t - 1] + alpha * heating_power[t - 1] - beta * (T[t - 1] - T_ext[t - 1])
 
+    # Soft comfort bounds: T can drift outside [Tmin, Tmax] only by paying a penalty.
+    for t in range(TIME_SLOTS):
+        prob += T[t] >= Tmin - T_under[t]
+        prob += T[t] <= Tmax + T_over[t]
+
+    # Add the comfort-violation penalty to the existing cost objective.
+    comfort_penalty = 10.0  # $/°C-hour of violation — high enough to dominate when feasible
+    prob.objective += comfort_penalty * pulp.lpSum(
+        T_under[t] + T_over[t] for t in range(TIME_SLOTS)
+    )
+
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    schedule = {app: [pulp.value(app_on[app][t]) for t in range(TIME_SLOTS)] for app in app_on}
-    schedule["Heating"] = [pulp.value(heating_power[t]) for t in range(TIME_SLOTS)]
+    def _val(v, default=0.0):
+        x = pulp.value(v)
+        return float(x) if x is not None else float(default)
 
-    temps = [pulp.value(T[t]) for t in range(TIME_SLOTS)]
-    cost = float(pulp.value(prob.objective) or 0.0)
+    schedule = {app: [_val(app_on[app][t]) for t in range(TIME_SLOTS)] for app in app_on}
+    schedule["Heating"] = [_val(heating_power[t]) for t in range(TIME_SLOTS)]
 
-    gi = [float(pulp.value(grid_import[t]) or 0.0) for t in range(TIME_SLOTS)]
-    ge = [float(pulp.value(grid_export[t]) or 0.0) for t in range(TIME_SLOTS)]
+    temps = [_val(T[t], default=20.0) for t in range(TIME_SLOTS)]
+    cost = _val(prob.objective)
+
+    gi = [_val(grid_import[t]) for t in range(TIME_SLOTS)]
+    ge = [_val(grid_export[t]) for t in range(TIME_SLOTS)]
 
     return {
         "schedule": schedule,

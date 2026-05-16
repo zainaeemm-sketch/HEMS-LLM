@@ -55,12 +55,18 @@ class HourlyWx:
 # keep OpenWeatherError, _safe_float, HourlyWx as-is
 
 
-def fetch_forecast25_hourly(lat: float, lon: float, api_key: str) -> List[HourlyWx]:
+def fetch_forecast25_hourly(lat: float, lon: float, api_key: str) -> Tuple[List[HourlyWx], int]:
     """
     FREE OpenWeather API (Forecast 2.5)
     Endpoint: https://api.openweathermap.org/data/2.5/forecast
     - 3-hour resolution
     - We expand it into hourly by repetition
+
+    Returns:
+        (hourly_list, tz_offset_seconds)
+        tz_offset_seconds is the location's offset from UTC, as reported
+        by OpenWeather (data.city.timezone). Needed to align the forecast
+        to local hour-of-day.
     """
     url = "https://api.openweathermap.org/data/2.5/forecast"
     params = {
@@ -80,6 +86,13 @@ def fetch_forecast25_hourly(lat: float, lon: float, api_key: str) -> List[Hourly
     items = data.get("list", [])
     if not items:
         raise OpenWeatherError("Forecast 2.5 returned empty data.")
+
+    # OpenWeather puts the location's timezone offset (seconds from UTC)
+    # at the top level under `city.timezone`. We need it to translate the
+    # UTC timestamps in `list[].dt` into local hours of the day.
+    tz_offset_seconds = int(_safe_float(
+        data.get("city", {}).get("timezone"), 0.0
+    ))
 
     hourly: List[HourlyWx] = []
 
@@ -101,7 +114,7 @@ def fetch_forecast25_hourly(lat: float, lon: float, api_key: str) -> List[Hourly
         if len(hourly) >= 48:
             break
 
-    return hourly[:48]
+    return hourly[:48], tz_offset_seconds
 
 def _day_of_year_from_unix(dt_utc: int) -> int:
     import datetime as _dt
@@ -143,19 +156,36 @@ def estimate_pv_kwh_24h_from_weather(
     performance_ratio: float = 0.85,
 ) -> List[float]:
     """
-    24h PV energy forecast (kWh per hour) using:
-      PV ≈ capacity_kw * clear_sky_shape * cloud_factor * temp_factor * PR
-    cloud_factor: 0%->1.0, 100%->0.2 (never fully zero)
+    Returns a 24-element list `pv` where `pv[h]` is the predicted PV
+    energy (kWh) for LOCAL hour-of-day `h` (0 = midnight, 12 = noon).
+
+    Iterates over up to 48h of forecast and, for each entry, computes
+    its local hour-of-day. The soonest available forecast for each
+    local hour wins (so we always prefer "today" over "tomorrow" data
+    where both are available).
+
+    PV ≈ capacity_kw * clear_sky_shape * cloud_factor * temp_factor * PR
+    cloud_factor: 0%→1.0, 100%→0.2 (never fully zero).
     """
     cap = max(_safe_float(capacity_kw, 0.0), 0.0)
     pr = min(max(_safe_float(performance_ratio, 0.85), 0.1), 1.0)
 
-    pv: List[float] = []
-    for h in hourly[:24]:
-        doy = _day_of_year_from_unix(h.dt)
-        hour_local = _hour_local_from_unix(h.dt, tz_offset_seconds)
+    pv: List[Optional[float]] = [None] * 24
 
-        clear_shape = _clear_sky_shape(lat_deg=lat, doy=doy, hour_local=hour_local)
+    for h in hourly:
+        hour_local = _hour_local_from_unix(h.dt, tz_offset_seconds)
+        if not (0 <= hour_local <= 23):
+            continue
+        if pv[hour_local] is not None:
+            # Already filled with a sooner forecast — keep that one.
+            continue
+
+        # Use LOCAL date for day-of-year (matters across midnight UTC).
+        doy = _day_of_year_from_unix(h.dt + tz_offset_seconds)
+
+        clear_shape = _clear_sky_shape(
+            lat_deg=lat, doy=doy, hour_local=hour_local
+        )
 
         clouds = max(0.0, min(100.0, _safe_float(h.clouds, 0.0)))
         cloud_factor = 1.0 - 0.008 * clouds  # 0%->1.0, 100%->0.2
@@ -164,8 +194,7 @@ def estimate_pv_kwh_24h_from_weather(
         temp_factor = _temp_derate(_safe_float(h.temp_c, 15.0))
 
         kwh = cap * clear_shape * cloud_factor * temp_factor * pr
-        pv.append(float(max(0.0, kwh)))
+        pv[hour_local] = float(max(0.0, kwh))
 
-    if len(pv) < 24:
-        pv += [0.0] * (24 - len(pv))
-    return pv[:24]
+    # Any local hours we didn't get a forecast for → 0.
+    return [(v if v is not None else 0.0) for v in pv]
