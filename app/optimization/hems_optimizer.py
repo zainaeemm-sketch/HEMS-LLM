@@ -78,10 +78,18 @@ def optimize_schedule(
         "Dryer": 3.0,
         "EV Charger": 7.0,
     }
+    # Case-insensitive lookup so "washing machine" / "WASHING MACHINE"
+    # all resolve to the correct rated power instead of falling back to 1.0.
+    _app_power_ci = {k.lower(): v for k, v in app_power.items()}
+
+    def _power_for(name: str) -> float:
+        return float(_app_power_ci.get(str(name).strip().lower(), 1.0))
 
     total_load = []
     for t in range(TIME_SLOTS):
-        fixed = pulp.lpSum(app_on.get(app, {}).get(t, 0) * app_power.get(app, 1.0) for app in app_on)
+        fixed = pulp.lpSum(
+            app_on.get(app, {}).get(t, 0) * _power_for(app) for app in app_on
+        )
         total_load.append(fixed + heating_power[t])
 
     net = [total_load[t] - pv_forecast[t] for t in range(TIME_SLOTS)]

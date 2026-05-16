@@ -775,11 +775,11 @@ elif page == "forecast":
                         lat, lon, resolved = geocode_city(city=city, api_key=api_key)
 
                         try:
-                            hourly = fetch_forecast25_hourly(lat=lat, lon=lon, api_key=api_key)
+                            hourly, tz_offset_seconds = fetch_forecast25_hourly(lat=lat, lon=lon, api_key=api_key)
                             source_note = "onecall_3.0"
                         except OpenWeatherError as e:
                             if "401" in str(e) or "subscription" in str(e).lower():
-                                hourly = fetch_forecast25_hourly(lat=lat, lon=lon, api_key=api_key)
+                                hourly, tz_offset_seconds = fetch_forecast25_hourly(lat=lat, lon=lon, api_key=api_key)
                                 source_note = "forecast_2.5_free"
                             else:
                                 raise
@@ -793,7 +793,7 @@ elif page == "forecast":
                             hourly=hourly,
                             lat=lat,
                             capacity_kw=capacity_kw,
-                            tz_offset_seconds=0,
+                            tz_offset_seconds=tz_offset_seconds,
                             performance_ratio=performance_ratio,
                         )
 
@@ -806,6 +806,7 @@ elif page == "forecast":
                             "resolved": resolved,
                             "lat": lat,
                             "lon": lon,
+                            "tz_offset_seconds": tz_offset_seconds,
                             "hourly": weather_hourly,
                         }
                         overwrite_latest_parameters(params)
@@ -844,9 +845,28 @@ elif page == "optimize":
         )
 
         T_ext = None
-        wh = (params.get("weather_hourly") or {}).get("hourly")
-        if isinstance(wh, list) and len(wh) >= 24:
-            T_ext = [safe_float(x.get("temp_c"), 15.0) for x in wh[:24]]
+        wh_block = params.get("weather_hourly") or {}
+        wh = wh_block.get("hourly")
+        tz_off = int(safe_float(wh_block.get("tz_offset_seconds"), 0.0))
+        if isinstance(wh, list) and wh:
+            # Align outdoor temps to LOCAL hour-of-day (same fix as PV).
+            t_by_hour: list = [None] * 24
+            for entry in wh:
+                dt = int(safe_float(entry.get("dt"), 0.0))
+                if dt <= 0:
+                    continue
+                hl = ((dt + tz_off) // 3600) % 24
+                if t_by_hour[hl] is None:
+                    t_by_hour[hl] = safe_float(entry.get("temp_c"), 15.0)
+            # Forward-fill any unfilled hours with the nearest known value
+            # (fall back to 15.0 if nothing at all).
+            last = 15.0
+            for i in range(24):
+                if t_by_hour[i] is None:
+                    t_by_hour[i] = last
+                else:
+                    last = t_by_hour[i]
+            T_ext = [float(x) for x in t_by_hour]
 
         if st.button("▶ Run Optimization"):
             results = optimize_schedule(
