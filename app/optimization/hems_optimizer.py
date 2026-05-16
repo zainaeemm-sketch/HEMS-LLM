@@ -193,6 +193,8 @@ def optimize_schedule(
     )
 
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    status_code = int(prob.status)
+    status_text = pulp.LpStatus.get(status_code, "Unknown")
 
     def _val(v, default=0.0):
         x = pulp.value(v)
@@ -214,4 +216,6 @@ def optimize_schedule(
         "grid_import": gi,
         "grid_export": ge,
         "T_ext": T_ext,
+        "status": status_text,
+        "status_code": status_code,
     }

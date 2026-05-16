@@ -879,7 +879,37 @@ elif page == "optimize":
             results["T_ext"] = T_ext
             params["optimization_results"] = results
             overwrite_latest_parameters(params)
-            st.success("✅ Optimization complete! Go to Results.")
+
+            status = results.get("status", "Unknown")
+            cost = float(results.get("cost") or 0.0)
+            sched = results.get("schedule", {}) or {}
+            # Count appliance "on" hours (exclude continuous Heating from the binary check)
+            scheduled_hours = {
+                app: int(sum(1 for v in (vals or []) if (v or 0.0) > 0.5))
+                for app, vals in sched.items()
+                if app != "Heating"
+            }
+            heat_hours = sum(1 for v in (sched.get("Heating") or []) if (v or 0.0) > 0.01)
+
+            if status == "Optimal":
+                st.success(f"✅ Optimization complete (solver: {status}). Total cost: ${cost:.2f}")
+            elif status == "Infeasible":
+                st.error(
+                    f"❌ Solver returned **Infeasible** — no feasible schedule exists "
+                    f"with the current constraints. Try widening Tmin/Tmax, increasing "
+                    f"max_power, or relaxing appliance start/end times."
+                )
+            else:
+                st.warning(f"⚠️ Solver status: **{status}** (cost: ${cost:.2f}). Results may be incomplete.")
+
+            with st.expander("Schedule summary", expanded=True):
+                if scheduled_hours:
+                    for app, hrs in scheduled_hours.items():
+                        st.write(f"- **{app}**: scheduled for **{hrs} h**")
+                else:
+                    st.write("- No shiftable/fixed appliances were scheduled.")
+                st.write(f"- **Heating**: active for **{heat_hours} h** (continuous power)")
+            st.caption("👉 Open '📊 View Results' for the full charts.")
 
 # ============================================================
 # 📊 RESULTS PAGE
@@ -892,6 +922,37 @@ elif page == "results":
         st.warning("⚠️ Run optimization first.")
     else:
         st.header("📊 Optimization Results")
+
+        # Detect "empty" / stale optimization results: if PV exists but the
+        # saved schedule has no scheduled hours and zero grid flow, the user
+        # most likely re-fetched PV without re-running optimization, or the
+        # previous solve was infeasible. Tell them.
+        sched_check = results.get("schedule") or {}
+        any_app_on = any(
+            (v or 0.0) > 0.5
+            for app, vals in sched_check.items()
+            if app != "Heating"
+            for v in (vals or [])
+        )
+        any_heating = any((v or 0.0) > 0.01 for v in (sched_check.get("Heating") or []))
+        gi_total = sum(float(x or 0.0) for x in (results.get("grid_import") or []))
+        pv_total = sum(float(x or 0.0) for x in (params.get("pv_forecast") or []))
+        status = results.get("status", "Unknown")
+
+        if status and status != "Optimal":
+            st.error(
+                f"❌ The last optimization solver status was **{status}**, "
+                f"so the displayed schedule may be incomplete. Please go back "
+                f"to '⚙️ Optimize Schedule' and run it again."
+            )
+        elif pv_total > 0 and not any_app_on and not any_heating and gi_total == 0:
+            st.warning(
+                "⚠️ The saved schedule is empty (no appliance is scheduled and "
+                "no grid energy flows). This usually means you re-fetched PV "
+                "or changed settings **without re-running Optimization**. "
+                "Open '⚙️ Optimize Schedule' and click '▶ Run Optimization' "
+                "to refresh these results."
+            )
 
         try:
             tou_prices = load_tou_prices()
