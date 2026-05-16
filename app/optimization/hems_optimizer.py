@@ -100,6 +100,10 @@ def optimize_schedule(
     for t in range(TIME_SLOTS):
         prob += grid_import[t] >= net[t]
         prob += grid_export[t] >= -net[t]
+        # Physical cap: you can only export what your PV actually produced.
+        # Without this, an inflated feed-in tariff (fit > tou_price) makes
+        # grid_export unbounded above and the LP returns "Unbounded".
+        prob += grid_export[t] <= pv_forecast[t]
 
     fit = max(0.0, safe_float(feed_in_tariff, 0.0))
     prob += pulp.lpSum([grid_import[t] * tou_prices[t] - grid_export[t] * fit for t in range(TIME_SLOTS)])

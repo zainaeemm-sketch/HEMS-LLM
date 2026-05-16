@@ -842,7 +842,19 @@ elif page == "optimize":
             2.0,
             0.0,
             0.01,
+            help="What the grid pays you per kWh exported. In most real markets "
+                 "this is BELOW your buy price (e.g. €0.05–0.15/kWh in Italy).",
         )
+        try:
+            _min_buy = min(tou) if tou else 0.0
+        except Exception:
+            _min_buy = 0.0
+        if feed_in_tariff > _min_buy and _min_buy > 0:
+            st.caption(
+                f"ℹ️ Your feed-in tariff (${feed_in_tariff:.2f}/kWh) is higher than your "
+                f"lowest buy price (${_min_buy:.2f}/kWh). The optimizer will aggressively "
+                f"prefer exporting all PV. Typical real-world FIT values are below the buy price."
+            )
 
         T_ext = None
         wh_block = params.get("weather_hourly") or {}
