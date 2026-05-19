@@ -920,7 +920,8 @@ elif page == "optimize":
                         st.write(f"- **{app}**: scheduled for **{hrs} h**")
                 else:
                     st.write("- No shiftable/fixed appliances were scheduled.")
-                st.write(f"- **Heating**: active for **{heat_hours} h** (continuous power)")
+                if "Heating" in sched:
+                    st.write(f"- **Heating**: active for **{heat_hours} h** (continuous power)")
             st.caption("👉 Open '📊 View Results' for the full charts.")
 
 # ============================================================
@@ -994,11 +995,13 @@ elif page == "results":
             use_container_width=True,
         )
 
-        st.markdown("### Thermal Comfort")
-        st.altair_chart(
-            build_temperature_chart(results, params),
-            use_container_width=True,
-        )
+        # Only show thermal chart if Heating was actually part of the optimization.
+        if "Heating" in (results.get("schedule") or {}):
+            st.markdown("### Thermal Comfort")
+            st.altair_chart(
+                build_temperature_chart(results, params),
+                use_container_width=True,
+            )
 
         st.markdown("### Energy Flow and Tariff")
         st.altair_chart(

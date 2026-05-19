@@ -60,12 +60,26 @@ def optimize_schedule(
 
     prob = pulp.LpProblem("HEMS_Optimizer", pulp.LpMinimize)
 
-    heating_power = pulp.LpVariable.dicts("heating", range(TIME_SLOTS), lowBound=0, upBound=2.0)
+    # Heating is a SPECIAL appliance: when the user adds "Heating" to their
+    # appliance list, we add a continuous heating-power variable + thermal
+    # model. When the user doesn't add Heating, none of that exists — and
+    # "Heating" is NOT shown in the schedule output.
+    heating_in_use = any(
+        str(name).strip().lower() == "heating" for name in appliances
+    )
+
+    if heating_in_use:
+        heating_power = pulp.LpVariable.dicts(
+            "heating", range(TIME_SLOTS), lowBound=0, upBound=2.0
+        )
+    else:
+        # Dummy: zero contribution to load, no decision variable.
+        heating_power = {t: 0.0 for t in range(TIME_SLOTS)}
 
     app_on = {
         app: pulp.LpVariable.dicts(f"{app}_on", range(TIME_SLOTS), cat="Binary")
         for app in appliances
-        if app != "Heating"
+        if str(app).strip().lower() != "heating"
     }
 
     app_power = {
@@ -172,29 +186,32 @@ def optimize_schedule(
                 app_start[s] for s in valid_starts if s <= t < s + duration
             )
 
-    # Thermal model with SOFT comfort bounds.
+    # Thermal model with SOFT comfort bounds — only when Heating is in use.
     # Hard min/max on T make the LP infeasible whenever heating capacity
     # can't beat outdoor heat loss. Soft bounds use slack variables so
     # violations are allowed but penalized in the objective.
-    T = pulp.LpVariable.dicts("T", range(TIME_SLOTS))  # unbounded
-    T_under = pulp.LpVariable.dicts("T_under", range(TIME_SLOTS), lowBound=0)
-    T_over = pulp.LpVariable.dicts("T_over", range(TIME_SLOTS), lowBound=0)
+    if heating_in_use:
+        T = pulp.LpVariable.dicts("T", range(TIME_SLOTS))  # unbounded
+        T_under = pulp.LpVariable.dicts("T_under", range(TIME_SLOTS), lowBound=0)
+        T_over = pulp.LpVariable.dicts("T_over", range(TIME_SLOTS), lowBound=0)
 
-    alpha, beta = 0.10, 0.05
-    prob += T[0] == 20.0
-    for t in range(1, TIME_SLOTS):
-        prob += T[t] == T[t - 1] + alpha * heating_power[t - 1] - beta * (T[t - 1] - T_ext[t - 1])
+        alpha, beta = 0.10, 0.05
+        prob += T[0] == 20.0
+        for t in range(1, TIME_SLOTS):
+            prob += T[t] == T[t - 1] + alpha * heating_power[t - 1] - beta * (T[t - 1] - T_ext[t - 1])
 
-    # Soft comfort bounds: T can drift outside [Tmin, Tmax] only by paying a penalty.
-    for t in range(TIME_SLOTS):
-        prob += T[t] >= Tmin - T_under[t]
-        prob += T[t] <= Tmax + T_over[t]
+        # Soft comfort bounds: T can drift outside [Tmin, Tmax] only by paying a penalty.
+        for t in range(TIME_SLOTS):
+            prob += T[t] >= Tmin - T_under[t]
+            prob += T[t] <= Tmax + T_over[t]
 
-    # Add the comfort-violation penalty to the existing cost objective.
-    comfort_penalty = 10.0  # $/°C-hour of violation — high enough to dominate when feasible
-    prob.objective += comfort_penalty * pulp.lpSum(
-        T_under[t] + T_over[t] for t in range(TIME_SLOTS)
-    )
+        # Add the comfort-violation penalty to the existing cost objective.
+        comfort_penalty = 10.0  # $/°C-hour of violation — high enough to dominate when feasible
+        prob.objective += comfort_penalty * pulp.lpSum(
+            T_under[t] + T_over[t] for t in range(TIME_SLOTS)
+        )
+    else:
+        T = None  # no thermal model
 
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     status_code = int(prob.status)
@@ -205,9 +222,12 @@ def optimize_schedule(
         return float(x) if x is not None else float(default)
 
     schedule = {app: [_val(app_on[app][t]) for t in range(TIME_SLOTS)] for app in app_on}
-    schedule["Heating"] = [_val(heating_power[t]) for t in range(TIME_SLOTS)]
-
-    temps = [_val(T[t], default=20.0) for t in range(TIME_SLOTS)]
+    if heating_in_use:
+        schedule["Heating"] = [_val(heating_power[t]) for t in range(TIME_SLOTS)]
+        temps = [_val(T[t], default=20.0) for t in range(TIME_SLOTS)]
+    else:
+        # No heating model — indoor temp stays at the initial 20°C placeholder.
+        temps = [20.0] * TIME_SLOTS
     cost = _val(prob.objective)
 
     gi = [_val(grid_import[t]) for t in range(TIME_SLOTS)]
