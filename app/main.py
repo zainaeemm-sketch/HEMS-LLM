@@ -24,6 +24,7 @@ from forecasting.openweather_pv_forecast import (
     estimate_pv_kwh_24h_from_weather,
 )
 from optimization.hems_optimizer import optimize_schedule
+from community_page import render_community_page
 from utils.llm_agent import chat_with_vectorengine
 
 load_env()
@@ -539,6 +540,7 @@ pages = {
     "🧩 Setup (Form)": "setup",
     "🔮 Forecast PV": "forecast",
     "⚙️ Optimize Schedule": "optimize",
+    "🏘️ Energy Community": "community",
     "📊 View Results": "results",
     "🤖 Assistant": "assistant",
 }
@@ -923,6 +925,12 @@ elif page == "optimize":
                 if "Heating" in sched:
                     st.write(f"- **Heating**: active for **{heat_hours} h** (continuous power)")
             st.caption("👉 Open '📊 View Results' for the full charts.")
+
+# ============================================================
+# 🏘️ ENERGY COMMUNITY PAGE
+# ============================================================
+elif page == "community":
+    render_community_page(load_latest_parameters())
 
 # ============================================================
 # 📊 RESULTS PAGE
