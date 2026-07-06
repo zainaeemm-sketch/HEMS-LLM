@@ -36,7 +36,23 @@ H = 24  # hourly planning horizon
 @dataclass
 class ECParams:
     n_users: int = 10          # Nuser
-    rounds: int = 3            # rounds of the game (MATLAB used 10)
+    rounds: int = 10           # MAX rounds of the game (safety cap)
+    converge: bool = True      # stop early at Nash equilibrium
+    tol_eur: float = 0.05      # convergence tolerance: a user is "settled"
+                               # when re-optimizing improves its daily cost
+                               # by less than this amount (EUR)
+    tol_kwh: float = 0.10      # ...and its profile changes by less than
+                               # this L1 norm (kWh over the day)
+    update_mode: str = "sequential"
+    # "sequential"  : after each household optimizes it immediately
+    #                 broadcasts the updated aggregate, so the next
+    #                 household reacts to fresh information (Gauss-Seidel
+    #                 best response). This matches the real communication
+    #                 protocol and converges to a Nash equilibrium.
+    # "simultaneous": all households optimize against the SAME start-of-
+    #                 round aggregate (exact parity with the MATLAB inner
+    #                 loop of general.m). Can oscillate: everyone shifts
+    #                 to the solar hours together, overshoots, retreats.
     cbuy_grid: float = 0.14    # €/kWh buy price
     csell_grid: float = 0.09   # €/kWh sell price
     gse_inc: float = 0.12      # €/kWh shared-energy incentive (GSE)
@@ -124,6 +140,100 @@ def make_synthetic_community(n_users: int = 10, seed: int = 42) -> list[UserProf
         total = crit + ls1 + ls2 + ls3 + la1
         users.append(UserProfile(total, crit, ls1, ls2, ls3, la1))
     return users
+
+
+# ----------------------------------------------------------------------
+# Real data loaders (replace the synthetic community with measured data)
+# ----------------------------------------------------------------------
+def load_profiles_from_mat(file) -> tuple[list[UserProfile], np.ndarray | None]:
+    """
+    Load user profiles from a MATLAB .mat file with the same structure as
+    prof30user_load_identify.mat used by general.m:
+
+      profh1..profhN : (6, 24) per user — rows: total, critical,
+                       shiftable 1, shiftable 2, shiftable 3, adjustable
+      (optionally)  Gensolar : 24-vector of PV generation
+
+    `file` can be a path or a file-like object (Streamlit uploader).
+    Returns (users, gensolar_or_None).
+    """
+    from scipy.io import loadmat  # scipy is already in requirements.txt
+    mat = loadmat(file, squeeze_me=True)
+
+    users: list[UserProfile] = []
+    i = 1
+    while f"profh{i}" in mat:
+        m = np.asarray(mat[f"profh{i}"], dtype=float)
+        if m.shape[0] != 6 and m.shape[1] == 6:   # tolerate transposed data
+            m = m.T
+        users.append(UserProfile(m[0], m[1], m[2], m[3], m[4], m[5]))
+        i += 1
+
+    if not users and "profh" in mat:
+        # fallback: one stacked (6*N, 24) matrix, 6 rows per user
+        m = np.asarray(mat["profh"], dtype=float)
+        for u in range(m.shape[0] // 6):
+            b = m[6 * u: 6 * u + 6]
+            users.append(UserProfile(b[0], b[1], b[2], b[3], b[4], b[5]))
+
+    gensolar = None
+    for key in ("Gensolar", "gensolar", "GenSolar"):
+        if key in mat:
+            gensolar = np.asarray(mat[key], dtype=float).ravel()[:H]
+            if gensolar.max() > 100:     # values look like W -> convert to kW
+                gensolar = gensolar / 1000.0
+            break
+    if not users:
+        raise ValueError(
+            "No user profiles found — expected variables profh1..profhN "
+            "of shape (6, 24) in the .mat file.")
+    return users, gensolar
+
+
+def load_profiles_from_csv(file) -> list[UserProfile]:
+    """
+    Load user profiles from a CSV in long-wide format:
+
+      user, component, h0, h1, ..., h23
+      1, total,    0.42, 0.40, ...
+      1, critical, 0.30, 0.30, ...
+      1, ls1, ...   1, ls2, ...   1, ls3, ...   1, la1, ...
+      2, total, ...
+
+    `component` must be one of: total, critical, ls1, ls2, ls3, la1.
+    """
+    import pandas as pd
+    df = pd.read_csv(file)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    hcols = [c for c in df.columns if c.startswith("h")][:H]
+    users = []
+    for uid in sorted(df["user"].unique()):
+        g = df[df["user"] == uid].set_index(
+            df[df["user"] == uid]["component"].str.strip().str.lower())
+        def row(name):
+            return (np.asarray(g.loc[name, hcols], dtype=float)
+                    if name in g.index else np.zeros(H))
+        total = row("total"); crit = row("critical")
+        ls1, ls2, ls3, la1 = row("ls1"), row("ls2"), row("ls3"), row("la1")
+        if not total.any():
+            total = crit + ls1 + ls2 + ls3 + la1
+        users.append(UserProfile(total, crit, ls1, ls2, ls3, la1))
+    if not users:
+        raise ValueError("CSV contained no rows.")
+    return users
+
+
+def profiles_csv_template(n_users: int = 10) -> "pd.DataFrame":
+    """A ready-to-fill CSV template (also handy to export the synthetic set)."""
+    import pandas as pd
+    rows = []
+    for i, u in enumerate(make_synthetic_community(n_users), start=1):
+        for comp, v in (("total", u.total), ("critical", u.critical),
+                        ("ls1", u.ls1), ("ls2", u.ls2),
+                        ("ls3", u.ls3), ("la1", u.la1)):
+            rows.append({"user": i, "component": comp,
+                         **{f"h{h}": round(float(v[h]), 4) for h in range(H)}})
+    return pd.DataFrame(rows)
 
 
 def default_solar_profile(peak_kw: float = 12.0) -> np.ndarray:
@@ -325,6 +435,85 @@ def _ga_user(enc: _UserEncoding, cost_fn, seeds: list[dict],
 
 
 # ----------------------------------------------------------------------
+# SINGLE-HOUSEHOLD AGENT — the piece that runs on EACH user's dashboard
+# in the real deployment.
+#
+# In the field, this dashboard optimizes ONLY the local household. Over
+# the communication link it receives just two community-level signals:
+#   * the AGGREGATED community load profile (24 values) — never the
+#     individual profiles of the other users, and
+#   * the available generation (+ shared-ESS schedule, if any).
+# It then re-schedules the local appliances (ECcost.m objective) and
+# broadcasts back the UPDATED AGGREGATE (old aggregate − old own profile
+# + new own profile). This is exactly what optimize_my_load() does.
+# run_ec_game() below is just a SIMULATOR that plays N such agents in
+# turn until Nash equilibrium.
+# ----------------------------------------------------------------------
+def optimize_my_load(my_profile: UserProfile,
+                     community_aggregate: np.ndarray,
+                     gensolar: np.ndarray,
+                     pess: np.ndarray | None = None,
+                     my_previous: np.ndarray | None = None,
+                     params: ECParams | None = None,
+                     warm_start: list[dict] | None = None,
+                     rng: np.random.Generator | None = None) -> dict:
+    """
+    One household's optimization step, given only local information plus
+    the broadcast aggregate.
+
+    my_profile          : this household's own load decomposition
+    community_aggregate : SUM of all households' current consumption (24,)
+                          as received over the communication link
+    gensolar            : community PV generation (24,)
+    pess                : shared-ESS profile broadcast by the community
+                          controller (24,), + = discharge; default zeros
+    my_previous         : this household's own current consumption (24,).
+                          Needed to subtract "me" out of the aggregate.
+                          Defaults to my_profile.total (initial state).
+    warm_start          : elite individuals kept from the previous round
+                          (MATLAB's final_pop2 warm start)
+
+    Returns dict:
+      consumption        : new own 24-h consumption to adopt
+      updated_aggregate  : new community aggregate to broadcast back
+      cost               : own objective value (EUR) — ECcost.m
+      elites             : individuals to pass as warm_start next round
+    """
+    p = params or ECParams()
+    rng = rng or np.random.default_rng(p.seed)
+    pess = np.zeros(H) if pess is None else np.asarray(pess, float)[:H]
+    my_prev = (np.asarray(my_previous, float)[:H]
+               if my_previous is not None else my_profile.total)
+
+    # I only know the aggregate and my own profile — the "others" term of
+    # ECcost.m (profEC) is reconstructed locally as aggregate − me:
+    prof_others = np.asarray(community_aggregate, float)[:H] - my_prev
+
+    enc = _encode_user(my_profile)
+
+    def cost_fn(ind):
+        psh = _decode(ind, enc)
+        return _ec_cost_user(psh, ind["a"],
+                             gensolar=gensolar, pess=pess,
+                             prof_ec_others=prof_others,
+                             crit=my_profile.critical,
+                             prof_total_user=my_profile.total,
+                             p=p, n4=enc.n4)
+
+    seeds = [_individual_from_profile(my_profile, enc)] + list(warm_start or [])
+    best, fv, finalpop = _ga_user(enc, cost_fn, seeds, p.ga_pop, p.ga_gen, rng)
+
+    new_cons = _decode(best, enc) + my_profile.critical
+    elite_k = max(1, round(p.ga_elite_frac * p.ga_pop))
+    return {
+        "consumption": new_cons,
+        "updated_aggregate": prof_others + new_cons,
+        "cost": float(fv),
+        "elites": [dict(finalpop[i]) for i in range(min(elite_k, len(finalpop)))],
+    }
+
+
+# ----------------------------------------------------------------------
 # ECcostESS.m — community battery objective  (+ linear constraint penalty)
 # ----------------------------------------------------------------------
 def _ec_cost_ess(ess: np.ndarray, *, gensolar, prof_ec, prof_init_total,
@@ -424,47 +613,49 @@ def run_ec_game(users: list[UserProfile] | None = None,
         gensolar = np.pad(gensolar, (0, H - gensolar.size))
     gensolar = gensolar * p.eff_solar
 
-    encs = [_encode_user(u) for u in users]
     crit = np.array([u.critical for u in users])          # (N,24)
     prof0 = np.array([u.total for u in users])            # (N,24) initial
     prof_ec_ttl = [prof0.sum(axis=0)]                     # PROFECTTL rows
     prof_ec_user = [prof0.copy()]                         # PROFECUSER cells
     pess = np.zeros(H)                                    # PESS row for round 1
-    elite_k = max(1, round(p.ga_elite_frac * p.ga_pop))
-    carry: list[list[dict]] = [[] for _ in users]         # final_pop2
+    carry: list[list[dict]] = [[] for _ in users]         # final_pop2 warm start
 
-    fval = np.zeros((p.rounds, p.n_users))
+    fval_rows: list[np.ndarray] = []
     ess_hist, soc_hist, fval_ess = [], [], []
+    prev_cost = np.full(p.n_users, np.inf)
+    converged_round = None
     total_steps = p.rounds * (p.n_users + (1 if p.ess_enabled else 0))
     step = 0
 
     for r in range(p.rounds):
-        usercons = np.zeros((p.n_users, H))
-        cur_ttl = prof_ec_ttl[r].copy()
-        for uix, (u, enc) in enumerate(zip(users, encs)):
-            prof_others = cur_ttl - prof_ec_user[r][uix]
+        usercons = prof_ec_user[r].copy()
+        fv_row = np.zeros(p.n_users)
+        running_agg = prof_ec_ttl[r].copy()   # the broadcast aggregate
 
-            def cost_fn(ind, _enc=enc, _prof_others=prof_others, _uix=uix):
-                psh = _decode(ind, _enc)
-                return _ec_cost_user(
-                    psh, ind["a"],
-                    gensolar=gensolar, pess=pess,
-                    prof_ec_others=_prof_others,
-                    crit=crit[_uix], prof_total_user=users[_uix].total,
-                    p=p, n4=_enc.n4)
-
-            seeds = [_individual_from_profile(u, enc)] + carry[uix]
-            best, fv, finalpop = _ga_user(enc, cost_fn, seeds,
-                                          p.ga_pop, p.ga_gen, rng)
-            carry[uix] = [dict(finalpop[i]) for i in range(min(elite_k, len(finalpop)))]
-            fval[r, uix] = fv
-            usercons[uix] = _decode(best, enc) + crit[uix]
+        # Each agent plays in turn: receives the aggregate over the
+        # "communication link", optimizes only its own home, broadcasts
+        # the updated aggregate back (best-response dynamics).
+        for uix, u in enumerate(users):
+            out = optimize_my_load(
+                my_profile=u,
+                community_aggregate=running_agg,
+                gensolar=gensolar, pess=pess,
+                my_previous=usercons[uix],
+                params=p, warm_start=carry[uix], rng=rng)
+            carry[uix] = out["elites"]
+            fv_row[uix] = out["cost"]
+            usercons[uix] = out["consumption"]
+            if p.update_mode == "sequential":
+                # broadcast immediately: next household reacts to the
+                # community profile that already includes my change
+                running_agg = out["updated_aggregate"]
 
             step += 1
             if progress_cb:
-                progress_cb(step / total_steps,
-                            f"Round {r+1}/{p.rounds} — user {uix+1}/{p.n_users}")
+                progress_cb(min(step / total_steps, 1.0),
+                            f"Round {r+1} — household {uix+1}/{p.n_users}")
 
+        fval_rows.append(fv_row)
         prof_ec_ttl.append(usercons.sum(axis=0))
         prof_ec_user.append(usercons)
 
@@ -473,14 +664,33 @@ def run_ec_game(users: list[UserProfile] | None = None,
                 gensolar, prof_ec_ttl[r], prof0.sum(axis=0), p, rng)
             soc = (p.ess_init_cap + np.cumsum(-ess)) / p.ess_size * 100.0
             ess_hist.append(ess); soc_hist.append(soc); fval_ess.append(fv_ess)
-            pess = ess.copy()   # users see this ESS profile next round
+            pess = ess.copy()   # broadcast: users see this ESS next round
             step += 1
             if progress_cb:
-                progress_cb(step / total_steps, f"Round {r+1}/{p.rounds} — battery")
+                progress_cb(min(step / total_steps, 1.0),
+                            f"Round {r+1} — shared battery")
+
+        # ---- Nash-equilibrium check ----------------------------------
+        # Stop when no household could improve its own cost by more than
+        # tol_eur AND no household's profile moved by more than tol_kwh:
+        # no user gains by deviating unilaterally -> equilibrium.
+        cost_gain = prev_cost - fv_row                    # >0 means improved
+        profile_move = np.abs(usercons - prof_ec_user[r]).sum(axis=1)
+        prev_cost = fv_row
+        if (p.converge and r > 0
+                and np.all(cost_gain < p.tol_eur)
+                and np.all(profile_move < p.tol_kwh)):
+            converged_round = r + 1
+            if progress_cb:
+                progress_cb(1.0, f"Nash equilibrium reached at round {r+1}")
+            break
+
+    n_rounds_run = len(fval_rows)
+    fval = np.array(fval_rows)
 
     # -------- shared-energy KPI:  sum(min(consumption, gen+ESS)) --------
     shared = []
-    for r in range(1, p.rounds + 1):
+    for r in range(1, n_rounds_run + 1):
         e = ess_hist[r - 1] if (p.ess_enabled and ess_hist) else np.zeros(H)
         shared.append(float(np.sum(np.minimum(prof_ec_ttl[r], gensolar + e))))
     shared0 = float(np.sum(np.minimum(prof_ec_ttl[0], gensolar)))
@@ -498,7 +708,10 @@ def run_ec_game(users: list[UserProfile] | None = None,
         "shared_energy_initial": shared0,
         "shared_energy_by_round": shared,
         "n_users": p.n_users,
-        "rounds": p.rounds,
+        "rounds": n_rounds_run,
+        "max_rounds": p.rounds,
+        "converged": converged_round is not None,
+        "converged_round": converged_round,
         "params": {
             "cbuy_grid": p.cbuy_grid, "csell_grid": p.csell_grid,
             "gse_inc": p.gse_inc, "c_comf": p.c_comf,
