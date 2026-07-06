@@ -21,6 +21,9 @@ from optimization.ec_optimizer import (
     ECParams,
     run_ec_game,
     make_synthetic_community,
+    load_profiles_from_mat,
+    load_profiles_from_csv,
+    profiles_csv_template,
     UserProfile,
 )
 
@@ -36,21 +39,63 @@ def _hours_df(series: dict) -> pd.DataFrame:
 def render_community_page(params: dict | None = None):
     st.header("🏘️ Energy Community Optimization")
     st.caption(
-        "Round-based community game: every household re-schedules its "
-        "3 shiftable + 1 adjustable loads against the rest of the community "
-        "(GSE shared-energy incentive), then a shared battery is optimized. "
+        "Distributed game: each household's dashboard optimizes ONLY its own "
+        "3 shiftable + 1 adjustable loads, seeing just the aggregated community "
+        "profile received over the communication link. After optimizing, it "
+        "broadcasts the updated aggregate back. Households keep re-optimizing "
+        "until no one can improve unilaterally — a Nash equilibrium. "
         "Port of the MATLAB `general.m` / `ECcost.m` / `ECcostESS.m` model."
     )
 
     params = params or {}
     pv_forecast = params.get("pv_forecast")
 
+    # ---------------- data source (real profiles vs synthetic) ----------------
+    with st.expander("📂 Household load profiles (data source)", expanded=False):
+        st.markdown(
+            "Upload the **real measured profiles** — either the original MATLAB "
+            "`.mat` file (`profh1..profhN`, each 6×24: total / critical / "
+            "shiftable 1–3 / adjustable, optionally `Gensolar`) or a CSV in the "
+            "template format. If nothing is uploaded, a synthetic community "
+            "with the same 6-row structure is generated."
+        )
+        up = st.file_uploader("Upload profiles (.mat or .csv)", type=["mat", "csv"])
+        mat_gensolar = None
+        if up is not None:
+            try:
+                if up.name.lower().endswith(".mat"):
+                    loaded_users, mat_gensolar = load_profiles_from_mat(up)
+                else:
+                    loaded_users = load_profiles_from_csv(up)
+                st.session_state["ec_users"] = loaded_users
+                st.session_state["ec_mat_gensolar"] = (
+                    mat_gensolar.tolist() if mat_gensolar is not None else None)
+                st.success(f"Loaded {len(loaded_users)} household profiles"
+                           + (" + PV generation" if mat_gensolar is not None else ""))
+            except Exception as e:
+                st.error(f"Could not read the file: {e}")
+        if st.session_state.get("ec_users"):
+            st.info(f"Using **{len(st.session_state['ec_users'])} uploaded** household profiles.")
+            if st.button("Discard uploaded profiles (back to synthetic)"):
+                st.session_state.pop("ec_users", None)
+                st.session_state.pop("ec_mat_gensolar", None)
+                st.rerun()
+        st.download_button(
+            "⬇️ Download CSV template (pre-filled with the synthetic community)",
+            profiles_csv_template(10).to_csv(index=False).encode(),
+            file_name="ec_profiles_template.csv", mime="text/csv",
+        )
+
     # ---------------- configuration ----------------
     with st.expander("⚙️ Community & market parameters", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
             n_users = st.number_input("Number of households", 2, 30, 10)
-            rounds = st.number_input("Rounds of the game", 1, 10, 3)
+            rounds = st.number_input("Max rounds (safety cap)", 1, 30, 10)
+            tol_eur = st.number_input(
+                "Nash tolerance (€/day)", 0.0, 5.0, 0.05, 0.01,
+                help="Equilibrium is declared when NO household improves its "
+                     "daily cost by more than this by re-optimizing.")
             seed = st.number_input("Random seed", 0, 9999, 0)
         with c2:
             cbuy = st.number_input("Buy price €/kWh (Cbuy_grid)", 0.0, 2.0, 0.14, 0.01)
@@ -72,6 +117,12 @@ def render_community_page(params: dict | None = None):
                      "represent the whole community's generation.",
             )
             eff_solar = st.number_input("Effsolar", 0.1, 3.0, 0.9, 0.05)
+            update_mode = st.radio(
+                "Aggregate broadcast", ["sequential", "simultaneous"],
+                horizontal=True,
+                help="sequential = each household broadcasts the updated "
+                     "aggregate immediately (real protocol, converges to Nash). "
+                     "simultaneous = exact MATLAB general.m parity (can oscillate).")
 
     with st.expander("🔋 Shared battery (ESS)"):
         b1, b2, b3 = st.columns(3)
@@ -98,8 +149,12 @@ def render_community_page(params: dict | None = None):
 
     # ---------------- run ----------------
     if st.button("▶ Run Community Optimization", type="primary"):
+        uploaded_users = st.session_state.get("ec_users")
+        if uploaded_users:
+            n_users = len(uploaded_users)
         p = ECParams(
             n_users=int(n_users), rounds=int(rounds), seed=int(seed),
+            converge=True, tol_eur=float(tol_eur), update_mode=str(update_mode),
             cbuy_grid=float(cbuy), csell_grid=float(csell),
             gse_inc=float(gse), c_comf=float(ccomf), eff_solar=float(eff_solar),
             ess_enabled=bool(ess_enabled), ess_size=float(ess_size),
@@ -112,8 +167,10 @@ def render_community_page(params: dict | None = None):
         gensolar = None
         if use_pv and pv_forecast:
             gensolar = np.asarray(pv_forecast, dtype=float)[:24] * float(pv_scale)
+        elif st.session_state.get("ec_mat_gensolar"):
+            gensolar = np.asarray(st.session_state["ec_mat_gensolar"], dtype=float)
 
-        users = make_synthetic_community(p.n_users, seed=p.seed or 42)
+        users = uploaded_users or make_synthetic_community(p.n_users, seed=p.seed or 42)
 
         bar = st.progress(0.0, text="Starting community game…")
 
@@ -134,6 +191,18 @@ def render_community_page(params: dict | None = None):
         return
 
     R = results["rounds"]
+    if results.get("converged"):
+        st.success(
+            f"🎯 **Nash equilibrium reached at round {results['converged_round']}** — "
+            f"no household can further improve its cost by changing its load "
+            f"profile unilaterally (tolerance in effect)."
+        )
+    else:
+        st.warning(
+            f"Game stopped at the max-round cap ({results.get('max_rounds', R)}) "
+            f"without formally reaching equilibrium — increase the cap or the "
+            f"tolerance, or use the *sequential* broadcast mode."
+        )
     gensolar = np.asarray(results["gensolar"])
     prof_ttl = [np.asarray(v) for v in results["prof_ec_ttl"]]
     pess = np.asarray(results["pess"])
