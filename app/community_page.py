@@ -26,6 +26,7 @@ from optimization.ec_optimizer import (
     load_profiles_from_mat,
     load_profiles_from_csv,
     load_generation_from_mat,
+    load_any_mat,
     load_bundled_dataset,
     profiles_csv_template,
     UserProfile,
@@ -79,23 +80,38 @@ def render_community_page(params: dict | None = None):
             "If neither is available, a synthetic community with the same "
             "6-row structure is generated."
         )
-        up = st.file_uploader("Upload profiles (.mat or .csv)", type=["mat", "csv"])
-        mat_gensolar = None
-        if up is not None:
-            try:
-                if up.name.lower().endswith(".mat"):
-                    loaded_users, mat_gensolar = load_profiles_from_mat(up)
-                else:
-                    loaded_users = load_profiles_from_csv(up)
-                st.session_state["ec_users"] = loaded_users
-                st.session_state["ec_mat_gensolar"] = (
-                    mat_gensolar.tolist() if mat_gensolar is not None else None)
-                st.session_state["ec_mat_wind"] = None
-                st.session_state["ec_data_label"] = f"uploaded file ({up.name})"
-                st.success(f"Loaded {len(loaded_users)} household profiles"
-                           + (" + PV generation" if mat_gensolar is not None else ""))
-            except Exception as e:
-                st.error(f"Could not read the file: {e}")
+        ups = st.file_uploader(
+            "Upload data files (.mat or .csv) — you can drop several at once, "
+            "e.g. prof30user_load_identify.mat + gensolar.mat + genwind.mat",
+            type=["mat", "csv"], accept_multiple_files=True)
+        if ups:
+            loaded_bits = []
+            for up in ups:
+                try:
+                    if up.name.lower().endswith(".csv"):
+                        st.session_state["ec_users"] = load_profiles_from_csv(up)
+                        loaded_bits.append(
+                            f"{len(st.session_state['ec_users'])} household "
+                            f"profiles ({up.name})")
+                    else:
+                        found = load_any_mat(up, up.name)
+                        if "users" in found:
+                            st.session_state["ec_users"] = found["users"]
+                            loaded_bits.append(
+                                f"{len(found['users'])} household profiles "
+                                f"({up.name})")
+                        if "gensolar" in found:
+                            st.session_state["ec_mat_gensolar"] = found["gensolar"].tolist()
+                            loaded_bits.append(f"solar generation ({up.name})")
+                        if "wind" in found:
+                            st.session_state["ec_mat_wind"] = found["wind"].tolist()
+                            loaded_bits.append(f"wind generation ({up.name})")
+                except Exception as e:
+                    st.error(f"Could not read {up.name}: {e}")
+            if loaded_bits:
+                st.session_state["ec_data_label"] = "uploaded: " + ", ".join(
+                    u.name for u in ups)
+                st.success("Loaded " + " + ".join(loaded_bits))
         if st.session_state.get("ec_users"):
             lbl = st.session_state.get("ec_data_label", "uploaded profiles")
             st.info(f"Using **{len(st.session_state['ec_users'])} households** — {lbl}.")
