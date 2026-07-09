@@ -57,7 +57,9 @@ class ECParams:
     csell_grid: float = 0.09   # €/kWh sell price
     gse_inc: float = 0.12      # €/kWh shared-energy incentive (GSE)
     c_comf: float = 0.06       # €/kWh discomfort valuation
-    eff_solar: float = 0.9     # PV scaling coefficient
+    eff_solar: float = 0.9     # PV scaling coefficient (Effsolar)
+    eff_wind: float = 0.0      # wind scaling coefficient (Effwind, general.m
+                               # default 0 — set >0 to include wind generation)
 
     # --- ESS ---
     ess_enabled: bool = True
@@ -221,6 +223,42 @@ def load_profiles_from_csv(file) -> list[UserProfile]:
     if not users:
         raise ValueError("CSV contained no rows.")
     return users
+
+
+def load_generation_from_mat(file) -> np.ndarray:
+    """
+    Load a 24-h generation profile from a .mat file (gensolar.mat with
+    `Gensolar`, or genwind.mat with `wind`). Values that look like watts
+    (max > 100) are converted to kW, matching the /1000 in general.m.
+    """
+    from scipy.io import loadmat
+    mat = loadmat(file, squeeze_me=True)
+    for key in ("Gensolar", "gensolar", "GenSolar", "wind", "Wind", "genwind"):
+        if key in mat:
+            g = np.asarray(mat[key], dtype=float).ravel()[:H]
+            if g.max() > 100:
+                g = g / 1000.0
+            return g
+    raise ValueError("No `Gensolar` or `wind` variable found in the file.")
+
+
+def load_bundled_dataset(data_dir) -> tuple[list[UserProfile],
+                                            np.ndarray | None,
+                                            np.ndarray | None]:
+    """
+    Load the real 30-household dataset shipped with the app
+    (app/data/prof30user_load_identify.mat + gensolar.mat + genwind.mat).
+    Returns (users, gensolar_kW, wind_kW); generation entries are None
+    if the corresponding file is missing.
+    """
+    from pathlib import Path
+    d = Path(data_dir)
+    users, gs = load_profiles_from_mat(str(d / "prof30user_load_identify.mat"))
+    if gs is None and (d / "gensolar.mat").exists():
+        gs = load_generation_from_mat(str(d / "gensolar.mat"))
+    wind = (load_generation_from_mat(str(d / "genwind.mat"))
+            if (d / "genwind.mat").exists() else None)
+    return users, gs, wind
 
 
 def profiles_csv_template(n_users: int = 10) -> "pd.DataFrame":
@@ -454,6 +492,7 @@ def optimize_my_load(my_profile: UserProfile,
                      gensolar: np.ndarray,
                      pess: np.ndarray | None = None,
                      my_previous: np.ndarray | None = None,
+                     current_individual: dict | None = None,
                      params: ECParams | None = None,
                      warm_start: list[dict] | None = None,
                      rng: np.random.Generator | None = None) -> dict:
@@ -464,19 +503,29 @@ def optimize_my_load(my_profile: UserProfile,
     my_profile          : this household's own load decomposition
     community_aggregate : SUM of all households' current consumption (24,)
                           as received over the communication link
-    gensolar            : community PV generation (24,)
+    gensolar            : community generation (24,)
     pess                : shared-ESS profile broadcast by the community
                           controller (24,), + = discharge; default zeros
     my_previous         : this household's own current consumption (24,).
                           Needed to subtract "me" out of the aggregate.
                           Defaults to my_profile.total (initial state).
+    current_individual  : this household's CURRENT schedule (decision
+                          variables). If given, the new schedule is adopted
+                          only when it improves the own cost by more than
+                          params.tol_eur — "no significant improvement →
+                          keep the current profile". This inertia is what
+                          makes the best-response dynamics settle into a
+                          Nash equilibrium instead of hopping between
+                          near-equivalent schedules forever.
     warm_start          : elite individuals kept from the previous round
                           (MATLAB's final_pop2 warm start)
 
     Returns dict:
-      consumption        : new own 24-h consumption to adopt
-      updated_aggregate  : new community aggregate to broadcast back
+      consumption        : own 24-h consumption to adopt (new or kept)
+      updated_aggregate  : community aggregate to broadcast back
       cost               : own objective value (EUR) — ECcost.m
+      individual         : adopted decision variables (for the next round)
+      changed            : True if the household actually changed schedule
       elites             : individuals to pass as warm_start next round
     """
     p = params or ECParams()
@@ -500,8 +549,19 @@ def optimize_my_load(my_profile: UserProfile,
                              prof_total_user=my_profile.total,
                              p=p, n4=enc.n4)
 
-    seeds = [_individual_from_profile(my_profile, enc)] + list(warm_start or [])
+    seeds = [_individual_from_profile(my_profile, enc)]
+    if current_individual is not None:
+        seeds.insert(0, dict(current_individual))
+    seeds += list(warm_start or [])
     best, fv, finalpop = _ga_user(enc, cost_fn, seeds, p.ga_pop, p.ga_gen, rng)
+
+    # ---- inertia: keep the current schedule unless the improvement is
+    # significant (this is the per-user Nash stopping rule) -------------
+    changed = True
+    if current_individual is not None:
+        stay_cost = cost_fn(current_individual)
+        if stay_cost - fv <= p.tol_eur:      # not significantly better
+            best, fv, changed = dict(current_individual), float(stay_cost), False
 
     new_cons = _decode(best, enc) + my_profile.critical
     elite_k = max(1, round(p.ga_elite_frac * p.ga_pop))
@@ -509,6 +569,9 @@ def optimize_my_load(my_profile: UserProfile,
         "consumption": new_cons,
         "updated_aggregate": prof_others + new_cons,
         "cost": float(fv),
+        "individual": {k: (v.copy() if hasattr(v, "copy") else v)
+                       for k, v in best.items()},
+        "changed": changed,
         "elites": [dict(finalpop[i]) for i in range(min(elite_k, len(finalpop)))],
     }
 
@@ -585,14 +648,18 @@ def _optimize_ess(gensolar, prof_ec, prof_init_total, p: ECParams, rng
 # ----------------------------------------------------------------------
 def run_ec_game(users: list[UserProfile] | None = None,
                 gensolar: np.ndarray | list | None = None,
+                genwind: np.ndarray | list | None = None,
                 params: ECParams | None = None,
                 progress_cb=None) -> dict:
     """
     Run the community optimization game.
 
     users     : list of UserProfile (defaults to a synthetic 10-user community)
-    gensolar  : 24-hour community PV generation in kWh/h (e.g. your app's
-                pv_forecast). Scaled by params.eff_solar, like general.m.
+    gensolar  : 24-hour community PV generation in kW (e.g. your app's
+                pv_forecast, or gensolar.mat). Scaled by params.eff_solar.
+    genwind   : optional 24-hour wind generation in kW (genwind.mat).
+                Scaled by params.eff_wind — general.m:
+                Gen = Gensolar*Effsolar/1000 + Effwind*wind
     params    : ECParams
     progress_cb(frac, msg) : optional callback for a Streamlit progress bar.
 
@@ -612,6 +679,11 @@ def run_ec_game(users: list[UserProfile] | None = None,
     if gensolar.size < H:
         gensolar = np.pad(gensolar, (0, H - gensolar.size))
     gensolar = gensolar * p.eff_solar
+    if genwind is not None and p.eff_wind > 0:
+        w = np.asarray(genwind, dtype=float).ravel()[:H]
+        if w.size < H:
+            w = np.pad(w, (0, H - w.size))
+        gensolar = gensolar + p.eff_wind * w   # total generation, as general.m
 
     crit = np.array([u.critical for u in users])          # (N,24)
     prof0 = np.array([u.total for u in users])            # (N,24) initial
@@ -622,7 +694,8 @@ def run_ec_game(users: list[UserProfile] | None = None,
 
     fval_rows: list[np.ndarray] = []
     ess_hist, soc_hist, fval_ess = [], [], []
-    prev_cost = np.full(p.n_users, np.inf)
+    current_ind: list[dict | None] = [None] * p.n_users   # adopted schedules
+    changes_per_round: list[int] = []
     converged_round = None
     total_steps = p.rounds * (p.n_users + (1 if p.ess_enabled else 0))
     step = 0
@@ -631,20 +704,25 @@ def run_ec_game(users: list[UserProfile] | None = None,
         usercons = prof_ec_user[r].copy()
         fv_row = np.zeros(p.n_users)
         running_agg = prof_ec_ttl[r].copy()   # the broadcast aggregate
+        n_changed = 0
 
         # Each agent plays in turn: receives the aggregate over the
-        # "communication link", optimizes only its own home, broadcasts
-        # the updated aggregate back (best-response dynamics).
+        # "communication link", optimizes only its own home, and adopts a
+        # new schedule ONLY if it is significantly better than keeping the
+        # current one (best-response dynamics with inertia).
         for uix, u in enumerate(users):
             out = optimize_my_load(
                 my_profile=u,
                 community_aggregate=running_agg,
                 gensolar=gensolar, pess=pess,
                 my_previous=usercons[uix],
+                current_individual=current_ind[uix],
                 params=p, warm_start=carry[uix], rng=rng)
             carry[uix] = out["elites"]
+            current_ind[uix] = out["individual"]
             fv_row[uix] = out["cost"]
             usercons[uix] = out["consumption"]
+            n_changed += int(out["changed"])
             if p.update_mode == "sequential":
                 # broadcast immediately: next household reacts to the
                 # community profile that already includes my change
@@ -656,6 +734,7 @@ def run_ec_game(users: list[UserProfile] | None = None,
                             f"Round {r+1} — household {uix+1}/{p.n_users}")
 
         fval_rows.append(fv_row)
+        changes_per_round.append(n_changed)
         prof_ec_ttl.append(usercons.sum(axis=0))
         prof_ec_user.append(usercons)
 
@@ -671,15 +750,10 @@ def run_ec_game(users: list[UserProfile] | None = None,
                             f"Round {r+1} — shared battery")
 
         # ---- Nash-equilibrium check ----------------------------------
-        # Stop when no household could improve its own cost by more than
-        # tol_eur AND no household's profile moved by more than tol_kwh:
-        # no user gains by deviating unilaterally -> equilibrium.
-        cost_gain = prev_cost - fv_row                    # >0 means improved
-        profile_move = np.abs(usercons - prof_ec_user[r]).sum(axis=1)
-        prev_cost = fv_row
-        if (p.converge and r > 0
-                and np.all(cost_gain < p.tol_eur)
-                and np.all(profile_move < p.tol_kwh)):
+        # Equilibrium: a complete round in which NO household found a
+        # schedule improving its own cost by more than tol_eur, i.e. no
+        # user gains by deviating unilaterally.
+        if p.converge and r > 0 and n_changed == 0:
             converged_round = r + 1
             if progress_cb:
                 progress_cb(1.0, f"Nash equilibrium reached at round {r+1}")
@@ -712,6 +786,7 @@ def run_ec_game(users: list[UserProfile] | None = None,
         "max_rounds": p.rounds,
         "converged": converged_round is not None,
         "converged_round": converged_round,
+        "changes_per_round": changes_per_round,
         "params": {
             "cbuy_grid": p.cbuy_grid, "csell_grid": p.csell_grid,
             "gse_inc": p.gse_inc, "c_comf": p.c_comf,
