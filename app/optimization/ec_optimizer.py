@@ -242,6 +242,50 @@ def load_generation_from_mat(file) -> np.ndarray:
     raise ValueError("No `Gensolar` or `wind` variable found in the file.")
 
 
+def load_any_mat(file, filename: str = "") -> dict:
+    """
+    Smart loader for the community .mat files. Detects what the file
+    contains and returns a dict with any of the keys:
+      users    : list[UserProfile]        (profh1..profhN found)
+      gensolar : np.ndarray (24,) in kW   (Gensolar found)
+      wind     : np.ndarray (24,) in kW   (wind found)
+    Raises ValueError with the list of variables found if none match.
+    """
+    from scipy.io import loadmat
+    mat = loadmat(file, squeeze_me=True)
+    out: dict = {}
+
+    if any(k.startswith("profh") and k != "profh" for k in mat):
+        # rewind for file-like objects before the second parse
+        if hasattr(file, "seek"):
+            file.seek(0)
+        users, gs = load_profiles_from_mat(file)
+        out["users"] = users
+        if gs is not None:
+            out["gensolar"] = gs
+
+    def _grab(*keys):
+        for k in keys:
+            if k in mat:
+                g = np.asarray(mat[k], dtype=float).ravel()[:H]
+                return g / 1000.0 if g.max() > 100 else g
+        return None
+
+    gs = _grab("Gensolar", "gensolar", "GenSolar")
+    if gs is not None:
+        out["gensolar"] = gs
+    w = _grab("wind", "Wind", "genwind")
+    if w is not None:
+        out["wind"] = w
+
+    if not out:
+        found = [k for k in mat if not k.startswith("__")]
+        raise ValueError(
+            f"'{filename or 'file'}' contains {found} — expected household "
+            f"profiles (profh1..profhN, each 6×24), `Gensolar`, or `wind`.")
+    return out
+
+
 def load_bundled_dataset(data_dir) -> tuple[list[UserProfile],
                                             np.ndarray | None,
                                             np.ndarray | None]:
