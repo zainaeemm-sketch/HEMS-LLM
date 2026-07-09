@@ -17,15 +17,23 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 
+from pathlib import Path
+
 from optimization.ec_optimizer import (
     ECParams,
     run_ec_game,
     make_synthetic_community,
     load_profiles_from_mat,
     load_profiles_from_csv,
+    load_generation_from_mat,
+    load_bundled_dataset,
     profiles_csv_template,
     UserProfile,
 )
+
+_DATA_DIR = Path(__file__).parent / "data"
+_BUNDLED = (_DATA_DIR / "prof30user_load_identify.mat").exists()
+
 
 
 def _hours_df(series: dict) -> pd.DataFrame:
@@ -51,13 +59,25 @@ def render_community_page(params: dict | None = None):
     pv_forecast = params.get("pv_forecast")
 
     # ---------------- data source (real profiles vs synthetic) ----------------
+    if _BUNDLED and "ec_users" not in st.session_state:
+        try:
+            _u, _gs, _w = load_bundled_dataset(_DATA_DIR)
+            st.session_state["ec_users"] = _u
+            st.session_state["ec_mat_gensolar"] = (_gs.tolist() if _gs is not None else None)
+            st.session_state["ec_mat_wind"] = (_w.tolist() if _w is not None else None)
+            st.session_state["ec_data_label"] = "bundled 30-household measured dataset"
+        except Exception:
+            pass
+
     with st.expander("📂 Household load profiles (data source)", expanded=False):
         st.markdown(
-            "Upload the **real measured profiles** — either the original MATLAB "
-            "`.mat` file (`profh1..profhN`, each 6×24: total / critical / "
-            "shiftable 1–3 / adjustable, optionally `Gensolar`) or a CSV in the "
-            "template format. If nothing is uploaded, a synthetic community "
-            "with the same 6-row structure is generated."
+            "By default the app loads the **bundled real 30-household dataset** "
+            "(`prof30user_load_identify.mat` + `gensolar.mat` + `genwind.mat`). "
+            "You can also upload a different MATLAB `.mat` file "
+            "(`profh1..profhN`, each 6×24: total / critical / shiftable 1–3 / "
+            "adjustable, optionally `Gensolar`) or a CSV in the template format. "
+            "If neither is available, a synthetic community with the same "
+            "6-row structure is generated."
         )
         up = st.file_uploader("Upload profiles (.mat or .csv)", type=["mat", "csv"])
         mat_gensolar = None
@@ -70,15 +90,18 @@ def render_community_page(params: dict | None = None):
                 st.session_state["ec_users"] = loaded_users
                 st.session_state["ec_mat_gensolar"] = (
                     mat_gensolar.tolist() if mat_gensolar is not None else None)
+                st.session_state["ec_mat_wind"] = None
+                st.session_state["ec_data_label"] = f"uploaded file ({up.name})"
                 st.success(f"Loaded {len(loaded_users)} household profiles"
                            + (" + PV generation" if mat_gensolar is not None else ""))
             except Exception as e:
                 st.error(f"Could not read the file: {e}")
         if st.session_state.get("ec_users"):
-            st.info(f"Using **{len(st.session_state['ec_users'])} uploaded** household profiles.")
-            if st.button("Discard uploaded profiles (back to synthetic)"):
-                st.session_state.pop("ec_users", None)
-                st.session_state.pop("ec_mat_gensolar", None)
+            lbl = st.session_state.get("ec_data_label", "uploaded profiles")
+            st.info(f"Using **{len(st.session_state['ec_users'])} households** — {lbl}.")
+            if st.button("Discard loaded profiles (use synthetic instead)"):
+                for k in ("ec_users", "ec_mat_gensolar", "ec_mat_wind", "ec_data_label"):
+                    st.session_state.pop(k, None)
                 st.rerun()
         st.download_button(
             "⬇️ Download CSV template (pre-filled with the synthetic community)",
@@ -90,7 +113,13 @@ def render_community_page(params: dict | None = None):
     with st.expander("⚙️ Community & market parameters", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            n_users = st.number_input("Number of households", 2, 30, 10)
+            _loaded = st.session_state.get("ec_users")
+            _max_u = len(_loaded) if _loaded else 30
+            n_users = st.number_input(
+                "Number of households", 2, _max_u, min(10, _max_u),
+                help=(f"A loaded dataset provides {_max_u} households; the "
+                      f"first N are used (general.m used Nuser=10)." if _loaded
+                      else "Size of the synthetic community."))
             rounds = st.number_input("Max rounds (safety cap)", 1, 30, 10)
             tol_eur = st.number_input(
                 "Nash tolerance (€/day)", 0.0, 5.0, 0.05, 0.01,
@@ -117,6 +146,11 @@ def render_community_page(params: dict | None = None):
                      "represent the whole community's generation.",
             )
             eff_solar = st.number_input("Effsolar", 0.1, 3.0, 0.9, 0.05)
+            _has_wind = bool(st.session_state.get("ec_mat_wind"))
+            eff_wind = st.number_input(
+                "Effwind (0 = wind off, as in general.m)", 0.0, 5.0,
+                0.0, 0.1, disabled=not _has_wind,
+                help="Scaling of the genwind.mat profile added to generation.")
             update_mode = st.radio(
                 "Aggregate broadcast", ["sequential", "simultaneous"],
                 horizontal=True,
@@ -151,10 +185,11 @@ def render_community_page(params: dict | None = None):
     if st.button("▶ Run Community Optimization", type="primary"):
         uploaded_users = st.session_state.get("ec_users")
         if uploaded_users:
-            n_users = len(uploaded_users)
+            uploaded_users = uploaded_users[: int(n_users)]
         p = ECParams(
             n_users=int(n_users), rounds=int(rounds), seed=int(seed),
             converge=True, tol_eur=float(tol_eur), update_mode=str(update_mode),
+            eff_wind=float(eff_wind),
             cbuy_grid=float(cbuy), csell_grid=float(csell),
             gse_inc=float(gse), c_comf=float(ccomf), eff_solar=float(eff_solar),
             ess_enabled=bool(ess_enabled), ess_size=float(ess_size),
@@ -171,6 +206,8 @@ def render_community_page(params: dict | None = None):
             gensolar = np.asarray(st.session_state["ec_mat_gensolar"], dtype=float)
 
         users = uploaded_users or make_synthetic_community(p.n_users, seed=p.seed or 42)
+        genwind = (np.asarray(st.session_state["ec_mat_wind"], dtype=float)
+                   if st.session_state.get("ec_mat_wind") else None)
 
         bar = st.progress(0.0, text="Starting community game…")
 
@@ -179,7 +216,7 @@ def render_community_page(params: dict | None = None):
 
         with st.spinner("Running the community game…"):
             results = run_ec_game(users=users, gensolar=gensolar,
-                                  params=p, progress_cb=_cb)
+                                  genwind=genwind, params=p, progress_cb=_cb)
         bar.empty()
         st.session_state["ec_results"] = results
         st.success("✅ Community optimization complete.")
@@ -248,7 +285,12 @@ def render_community_page(params: dict | None = None):
         "round": list(range(1, R + 1)),
         "shared energy (kWh)": results["shared_energy_by_round"],
         "mean user cost (€)": [float(np.mean(r)) for r in results["fval"]],
+        "households that changed schedule":
+            results.get("changes_per_round", [None] * R),
     })
+    st.caption("Households changing schedule per round: "
+               + " → ".join(str(c) for c in results.get("changes_per_round", []))
+               + "  (equilibrium = a round with 0 changes)")
     cc1, cc2 = st.columns(2)
     with cc1:
         st.altair_chart(
