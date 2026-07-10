@@ -244,11 +244,14 @@ def render_community_page(params: dict | None = None):
         return
 
     R = results["rounds"]
+    best_r = results.get("best_round", R)
     if results.get("converged"):
         st.success(
             f"🎯 **Nash equilibrium reached at round {results['converged_round']}** — "
             f"no household can further improve its cost by changing its load "
-            f"profile unilaterally (tolerance in effect)."
+            f"profile unilaterally (tolerance in effect). "
+            f"**Recommended solution: round {best_r}** (highest shared energy — "
+            f"the best round is kept even if it is not the last)."
         )
     else:
         st.warning(
@@ -260,26 +263,29 @@ def render_community_page(params: dict | None = None):
     prof_ttl = [np.asarray(v) for v in results["prof_ec_ttl"]]
     pess = np.asarray(results["pess"])
 
-    # KPIs
+    # KPIs — all "after" figures refer to the RECOMMENDED (best) round
     s0 = results["shared_energy_initial"]
+    s_best = results.get("shared_energy_best",
+                         results["shared_energy_by_round"][-1])
     s_final = results["shared_energy_by_round"][-1]
-    best_round = int(np.argmax(results["shared_energy_by_round"]))
-    s_best = results["shared_energy_by_round"][best_round]
+    prof_best = np.asarray(results.get("prof_best", results["prof_ec_ttl"][-1]))
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Shared energy — before", f"{s0:.1f} kWh")
-    k2.metric("Shared energy — final round", f"{s_final:.1f} kWh",
+    k2.metric(f"Shared energy — recommended (round {best_r})",
+              f"{s_best:.1f} kWh", f"{(s_best - s0):+.1f} kWh")
+    k3.metric("Shared energy — last round", f"{s_final:.1f} kWh",
               f"{(s_final - s0):+.1f} kWh")
-    k3.metric("Best round", f"#{best_round + 1}", f"{s_best:.1f} kWh")
-    k4.metric("Community peak (final)",
-              f"{prof_ttl[-1].max():.2f} kW",
-              f"{(prof_ttl[-1].max() - prof_ttl[0].max()):+.2f} vs initial")
+    k4.metric("Community peak (recommended)",
+              f"{prof_best.max():.2f} kW",
+              f"{(prof_best.max() - prof_ttl[0].max()):+.2f} vs initial")
 
     # ---- community profile chart (the main figure of general.m) ----
     st.subheader("Community load vs generation")
     df = _hours_df({
         "EC total — initial": prof_ttl[0],
-        f"EC total — after round {R}": prof_ttl[-1],
-        "Generation + ESS": gensolar + pess,
+        f"EC total — recommended (round {best_r})": prof_best,
+        "Generation + ESS (recommended)": gensolar + pess,
+        "Generation only": gensolar,
         "Base (critical) load": np.asarray(results["crit_total"]),
     })
     chart = (
@@ -326,6 +332,8 @@ def render_community_page(params: dict | None = None):
     # ---- battery ----
     if results["params"]["ess_enabled"] and results["soc"]:
         st.subheader("Shared battery")
+        st.caption(f"Battery schedule of the recommended solution (round {best_r}); "
+                   "＋ = discharge, − = charge.")
         bdf = pd.DataFrame({
             "hour": np.arange(24),
             "power (kW)": pess,           # >0 discharge, <0 charge
