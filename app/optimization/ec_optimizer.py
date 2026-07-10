@@ -750,6 +750,23 @@ def run_ec_game(users: list[UserProfile] | None = None,
         running_agg = prof_ec_ttl[r].copy()   # the broadcast aggregate
         n_changed = 0
 
+        # ---- battery plans FIRST, on the current aggregate -------------
+        # The controller announces the ESS schedule for this round before
+        # the households play, so households respond to generation + ESS.
+        # (Playing the battery after the households lets them absorb all
+        # surplus first, leaving nothing to store under the surplus-only
+        # charging rule — the battery would sit idle regardless of size.)
+        if p.ess_enabled:
+            ess, fv_ess = _optimize_ess(
+                gensolar, prof_ec_ttl[r], prof0.sum(axis=0), p, rng)
+            soc = (p.ess_init_cap + np.cumsum(-ess)) / p.ess_size * 100.0
+            ess_hist.append(ess); soc_hist.append(soc); fval_ess.append(fv_ess)
+            pess = ess.copy()   # broadcast: households see this ESS now
+            step += 1
+            if progress_cb:
+                progress_cb(min(step / total_steps, 1.0),
+                            f"Round {r+1} — shared battery")
+
         # Each agent plays in turn: receives the aggregate over the
         # "communication link", optimizes only its own home, and adopts a
         # new schedule ONLY if it is significantly better than keeping the
@@ -782,17 +799,6 @@ def run_ec_game(users: list[UserProfile] | None = None,
         prof_ec_ttl.append(usercons.sum(axis=0))
         prof_ec_user.append(usercons)
 
-        if p.ess_enabled:
-            ess, fv_ess = _optimize_ess(
-                gensolar, prof_ec_ttl[r], prof0.sum(axis=0), p, rng)
-            soc = (p.ess_init_cap + np.cumsum(-ess)) / p.ess_size * 100.0
-            ess_hist.append(ess); soc_hist.append(soc); fval_ess.append(fv_ess)
-            pess = ess.copy()   # broadcast: users see this ESS next round
-            step += 1
-            if progress_cb:
-                progress_cb(min(step / total_steps, 1.0),
-                            f"Round {r+1} — shared battery")
-
         # ---- Nash-equilibrium check ----------------------------------
         # Equilibrium: a complete round in which NO household found a
         # schedule improving its own cost by more than tol_eur, i.e. no
@@ -813,14 +819,31 @@ def run_ec_game(users: list[UserProfile] | None = None,
         shared.append(float(np.sum(np.minimum(prof_ec_ttl[r], gensolar + e))))
     shared0 = float(np.sum(np.minimum(prof_ec_ttl[0], gensolar)))
 
+    # -------- keep-best memory (Saber's rule) ---------------------------
+    # The game terminates on the Nash condition (no household can improve
+    # its OWN cost), but the community-level optimum may occur in an
+    # earlier round. Keep every round's solution and recommend the one
+    # with the highest shared energy, rather than blindly the last.
+    best_idx = int(np.argmax(shared)) if shared else 0
+    ess_best = (ess_hist[best_idx] if (p.ess_enabled and ess_hist)
+                else np.zeros(H))
+    soc_best = (soc_hist[best_idx] if (p.ess_enabled and soc_hist) else [])
+
     return {
         "gensolar": gensolar.tolist(),
         "prof_ec_ttl": [v.tolist() for v in prof_ec_ttl],
         "prof_ec_user": [m.tolist() for m in prof_ec_user],
         "crit_total": crit.sum(axis=0).tolist(),
-        "pess": (ess_hist[-1].tolist() if ess_hist else [0.0] * H),
+        # recommended solution = round with the highest shared energy
+        "best_round": best_idx + 1,
+        "shared_energy_best": (shared[best_idx] if shared else shared0),
+        "prof_best": prof_ec_ttl[best_idx + 1].tolist(),
+        "prof_user_best": prof_ec_user[best_idx + 1].tolist(),
+        "pess": (np.asarray(ess_best).tolist()),
+        "soc": (list(soc_best) if len(soc_best) else []),
+        # last-round battery kept for reference/inspection
+        "pess_last": (ess_hist[-1].tolist() if ess_hist else [0.0] * H),
         "ess_history": [e.tolist() for e in ess_hist],
-        "soc": (soc_hist[-1].tolist() if soc_hist else []),
         "fval": fval.tolist(),
         "fval_ess": fval_ess,
         "shared_energy_initial": shared0,
