@@ -674,7 +674,12 @@ if page == "setup":
         colA, colB = st.columns(2)
 
         with colA:
-            city = st.text_input("City", value=default_city)
+            city = st.text_input(
+                "City",
+                value=default_city,
+                help="Enter the city followed by the country, separated by a comma "
+                     "(City, Country), e.g. **Palermo, Italy**.",
+            )
             user_type = st.selectbox(
                 "User Type",
                 ["residential", "industrial"],
