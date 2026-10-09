@@ -33,7 +33,7 @@ class ApplianceSetting(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     can_shift: Optional[bool] = False
-    duration_hours: Optional[int] = 1
+    duration_hours: Optional[float] = 1.0
 
     @validator("start_time")
     def validate_start_time(cls, v):
@@ -49,15 +49,17 @@ class ApplianceSetting(BaseModel):
 
     @validator("duration_hours", pre=True)
     def validate_duration(cls, v):
+        # Cycle length in hours, in 15-minute steps (e.g. 0.25, 1.5, 2.75).
         if v in (None, ""):
-            return 1
+            return 1.0
         try:
-            n = int(v)
+            hours = float(v)
         except (TypeError, ValueError):
-            raise ValueError("duration_hours must be an integer")
-        if not (1 <= n <= 24):
-            raise ValueError("duration_hours must be between 1 and 24")
-        return n
+            raise ValueError("duration_hours must be a number of hours (e.g. 1.25)")
+        hours = round(hours * 4) / 4  # snap to the nearest quarter hour
+        if not (0.25 <= hours <= 24):
+            raise ValueError("duration_hours must be between 0:15 and 24:00")
+        return hours
 
 
 class HEMSParameters(BaseModel):

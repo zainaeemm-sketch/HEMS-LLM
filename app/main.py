@@ -42,19 +42,73 @@ def safe_float(value, default=0.0):
         return float(default)
 
 
+def _format_duration(hours) -> str:
+    """Hours as float (e.g. 1.25) -> 'H:MM' (e.g. '1:15') for the editor."""
+    try:
+        total_min = int(round(float(hours) * 60))
+    except (TypeError, ValueError):
+        return ""
+    return f"{total_min // 60}:{total_min % 60:02d}"
+
+
+def _parse_duration_exact(value):
+    """'1:15', '0:45', '2', '1.25' -> hours as typed (no rounding). None if invalid/empty."""
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        if ":" in s:
+            hh, mm = s.split(":", 1)
+            return int(hh or 0) + int(mm or 0) / 60.0
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_duration(value):
+    """Hours snapped to 15 minutes and clamped to 0:15..24:00. Empty -> 1 h, invalid -> None."""
+    if not str(value).strip():
+        return 1.0
+    hours = _parse_duration_exact(value)
+    if hours is None:
+        return None
+    return max(0.25, min(round(hours * 4) / 4, 24.0))
+
+
+def _snap_quarter(value, allow_2400: bool):
+    """'11:10' -> '11:15' (nearest quarter hour). Returns the input unchanged if unparsable."""
+    try:
+        hh, mm = str(value).strip().split(":")[:2]
+        minutes = int(hh) * 60 + int(mm)
+    except ValueError:
+        return value
+    minutes = int(round(minutes / 15.0)) * 15
+    cap = 24 * 60 if allow_2400 else 24 * 60 - 15
+    minutes = max(0, min(minutes, cap))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 def _as_appliance_rows(appliances: list[dict]) -> pd.DataFrame:
     if not appliances:
         appliances = []
-    return pd.DataFrame(
+    df = pd.DataFrame(
         appliances,
         columns=["name", "start_time", "end_time", "can_shift", "duration_hours"],
-    ).fillna("")
+    )
+    # Show durations as H:MM text (e.g. 1:15) in the editor.
+    df["duration_hours"] = df["duration_hours"].map(
+        lambda v: _format_duration(v) if str(v).strip() not in ("", "nan", "None") else ""
+    )
+    return df.fillna("")
 
 
-def _df_to_appliances(df: pd.DataFrame) -> list[dict]:
+def _df_to_appliances(df: pd.DataFrame, notes: list | None = None) -> list[dict]:
+    """Editor rows -> appliance dicts. Times/durations are snapped to 15 minutes;
+    any adjustment is described in `notes` so the user can see it."""
     rows = []
     if df is None or df.empty:
         return rows
+    notes = notes if notes is not None else []
 
     for _, r in df.iterrows():
         name = str(r.get("name", "")).strip()
@@ -68,16 +122,30 @@ def _df_to_appliances(df: pd.DataFrame) -> list[dict]:
         if start_time == "24:00":
             start_time = "00:00"
 
+        for label, value, allow_2400 in (("start", start_time, False), ("end", end_time, True)):
+            if value is None:
+                continue
+            snapped = _snap_quarter(value, allow_2400)
+            if snapped != value:
+                notes.append(f"{name}: {label} time {value} rounded to {snapped} (15-minute steps).")
+            if label == "start":
+                start_time = snapped
+            else:
+                end_time = snapped
+
         can_shift = r.get("can_shift", False)
         if isinstance(can_shift, str):
             can_shift = can_shift.lower() in ("true", "1", "yes", "y")
 
-        raw_duration = r.get("duration_hours", 1)
-        try:
-            duration_hours = int(raw_duration) if str(raw_duration).strip() != "" else 1
-        except (TypeError, ValueError):
-            duration_hours = 1
-        duration_hours = max(1, min(duration_hours, 24))
+        raw_duration = r.get("duration_hours", "")
+        duration_hours = _parse_duration(raw_duration)
+        if duration_hours is None:
+            notes.append(f"{name}: duration '{raw_duration}' not understood; using 1:00.")
+            duration_hours = 1.0
+        elif str(raw_duration).strip() and abs(duration_hours - _parse_duration_exact(raw_duration)) > 1e-9:
+            notes.append(
+                f"{name}: duration {raw_duration} rounded to {_format_duration(duration_hours)} (15-minute steps)."
+            )
 
         rows.append(
             {
@@ -449,6 +517,7 @@ def _summarize_for_assistant(params: dict) -> dict:
             "grid_export": opt.get("grid_export"),
             "temps": opt.get("temps"),
             "schedule": opt.get("schedule"),
+            "appliance_run_windows": opt.get("windows"),
         }
 
     weather = params.get("weather_hourly") or None
@@ -624,9 +693,11 @@ if page == "setup":
 
         st.subheader("⚙️ Appliances")
         st.caption(
-            "Add/edit appliances. Use HH:MM 24h format or leave empty. "
+            "Add/edit appliances. Use HH:MM 24h format in 15-minute steps "
+            "(e.g. 11:00, 11:15, 11:30, 11:45) or leave empty. "
             "Midnight start should be 00:00; end time may be 24:00. "
-            "Duration (h) is the operating time of one cycle (e.g. washing machine = 1, EV = 4)."
+            "Duration (H:MM) is the operating time of one cycle, also in 15-minute steps "
+            "(e.g. kettle = 0:15, washing machine = 1:15, EV = 4:00)."
         )
         edited_df = st.data_editor(
             default_apps_df,
@@ -634,16 +705,20 @@ if page == "setup":
             width="stretch",
             column_config={
                 "name": st.column_config.TextColumn("Name", required=True),
-                "start_time": st.column_config.TextColumn("Start (HH:MM)", required=False),
-                "end_time": st.column_config.TextColumn("End (HH:MM)", required=False),
+                "start_time": st.column_config.TextColumn(
+                    "Start (HH:MM)", required=False,
+                    help="Earliest start, in 15-minute steps (e.g. 11:15).",
+                ),
+                "end_time": st.column_config.TextColumn(
+                    "End (HH:MM)", required=False,
+                    help="Latest finish, in 15-minute steps (e.g. 12:45); 24:00 for midnight.",
+                ),
                 "can_shift": st.column_config.CheckboxColumn("Can Shift?", default=False),
-                "duration_hours": st.column_config.NumberColumn(
-                    "Duration (h)",
-                    min_value=1,
-                    max_value=24,
-                    step=1,
-                    default=1,
-                    help="How many hours one full cycle of this appliance takes.",
+                "duration_hours": st.column_config.TextColumn(
+                    "Duration (H:MM)",
+                    default="1:00",
+                    help="How long one full cycle takes, in 15-minute steps: "
+                         "0:15, 0:30, 0:45, 1:00, 1:15 … (decimal hours like 1.25 also work).",
                 ),
             },
         )
@@ -657,7 +732,10 @@ if page == "setup":
 
     if submitted:
         dnd_list = [d.strip() for d in (do_not_disturb or "").split(",") if d.strip()]
-        appliances = _df_to_appliances(edited_df)
+        appliance_notes: list = []
+        appliances = _df_to_appliances(edited_df, appliance_notes)
+        for note in appliance_notes:
+            st.info(f"ℹ️ {note}")
 
         new_params = {
             "city": city.strip(),
@@ -853,8 +931,8 @@ elif page == "optimize":
             _min_buy = 0.0
         if feed_in_tariff > _min_buy and _min_buy > 0:
             st.caption(
-                f"ℹ️ Your feed-in tariff (${feed_in_tariff:.2f}/kWh) is higher than your "
-                f"lowest buy price (${_min_buy:.2f}/kWh). The optimizer will aggressively "
+                f"ℹ️ Your feed-in tariff (\\${feed_in_tariff:.2f}/kWh) is higher than your "
+                f"lowest buy price (\\${_min_buy:.2f}/kWh). The optimizer will aggressively "
                 f"prefer exporting all PV. Typical real-world FIT values are below the buy price."
             )
 
@@ -897,13 +975,8 @@ elif page == "optimize":
             status = results.get("status", "Unknown")
             cost = float(results.get("cost") or 0.0)
             sched = results.get("schedule", {}) or {}
-            # Count appliance "on" hours (exclude continuous Heating from the binary check)
-            scheduled_hours = {
-                app: int(sum(1 for v in (vals or []) if (v or 0.0) > 0.5))
-                for app, vals in sched.items()
-                if app != "Heating"
-            }
-            heat_hours = sum(1 for v in (sched.get("Heating") or []) if (v or 0.0) > 0.01)
+            sched_15 = results.get("schedule_15min") or {}
+            slot_min = int(results.get("slot_minutes") or 60)
 
             if status == "Optimal":
                 st.success(f"✅ Optimization complete (solver: {status}). Total cost: ${cost:.2f}")
@@ -916,14 +989,60 @@ elif page == "optimize":
             else:
                 st.warning(f"⚠️ Solver status: **{status}** (cost: ${cost:.2f}). Results may be incomplete.")
 
+            def _fmt_minutes(total_min: int) -> str:
+                h, m = divmod(int(total_min), 60)
+                if h and m:
+                    return f"{h} h {m} min"
+                return f"{h} h" if h else f"{m} min"
+
+            def _windows_from(vals, threshold, minutes_per_slot):
+                """Fallback for results saved before the 15-minute optimizer."""
+                out, start = [], None
+                for t, v in enumerate(vals or []):
+                    on = (v or 0.0) > threshold
+                    if on and start is None:
+                        start = t
+                    elif not on and start is not None:
+                        out.append((start, t))
+                        start = None
+                if start is not None:
+                    out.append((start, len(vals)))
+                fmt = lambda k: f"{k * minutes_per_slot // 60:02d}:{k * minutes_per_slot % 60:02d}"
+                return [(fmt(a), fmt(b)) for a, b in out]
+
+            def _app_windows(app, threshold):
+                saved = (results.get("windows") or {}).get(app)
+                if saved is not None:
+                    return [tuple(w) for w in saved]
+                return _windows_from(sched.get(app), threshold, 60)
+
+            def _run_minutes(app, threshold):
+                vals = sched_15.get(app) if sched_15 else sched.get(app)
+                per_slot = slot_min if sched_15 else 60
+                return sum(per_slot for v in (vals or []) if (v or 0.0) > threshold)
+
             with st.expander("Schedule summary", expanded=True):
-                if scheduled_hours:
-                    for app, hrs in scheduled_hours.items():
-                        st.write(f"- **{app}**: scheduled for **{hrs} h**")
+                apps = [a for a in sched if a != "Heating"]
+                if apps:
+                    for app in apps:
+                        windows = _app_windows(app, 0.5)
+                        if windows:
+                            when = ", ".join(f"{a}–{b}" for a, b in windows)
+                            st.write(
+                                f"- **{app}**: scheduled for **{_fmt_minutes(_run_minutes(app, 0.5))}**, "
+                                f"from **{when}**"
+                            )
+                        else:
+                            st.write(f"- **{app}**: not scheduled")
                 else:
                     st.write("- No shiftable/fixed appliances were scheduled.")
                 if "Heating" in sched:
-                    st.write(f"- **Heating**: active for **{heat_hours} h** (continuous power)")
+                    windows = _app_windows("Heating", 0.01)
+                    when = ", ".join(f"{a}–{b}" for a, b in windows)
+                    st.write(
+                        f"- **Heating**: active for **{_fmt_minutes(_run_minutes('Heating', 0.01))}** "
+                        f"(continuous power)" + (f", during **{when}**" if when else "")
+                    )
             st.caption("👉 Open '📊 View Results' for the full charts.")
 
 # ============================================================
@@ -949,8 +1068,10 @@ elif page == "results":
         # most likely re-fetched PV without re-running optimization, or the
         # previous solve was infeasible. Tell them.
         sched_check = results.get("schedule") or {}
+        # Hourly values are the fraction of the hour an appliance runs
+        # (0.25 = 15 min), so anything above zero means it is scheduled.
         any_app_on = any(
-            (v or 0.0) > 0.5
+            (v or 0.0) > 0.01
             for app, vals in sched_check.items()
             if app != "Heating"
             for v in (vals or [])
@@ -985,7 +1106,9 @@ elif page == "results":
         pv_forecast = params.get("pv_forecast") or []
 
         total_cost = safe_float(results.get("cost"), 0.0)
-        peak_import = max(grid_import) if grid_import else 0.0
+        # Peak power from the 15-minute profile when available (hourly values are averages).
+        _gi_fine = results.get("grid_import_15min") or grid_import
+        peak_import = max(_gi_fine) if _gi_fine else 0.0
         total_import = sum(grid_import) if grid_import else 0.0
         total_export = sum(grid_export) if grid_export else 0.0
         total_pv = sum(pv_forecast[:24]) if pv_forecast else 0.0
