@@ -25,7 +25,7 @@ from forecasting.openweather_pv_forecast import (
 )
 from optimization.hems_optimizer import optimize_schedule
 from community_page import render_community_page
-from utils.llm_agent import chat_with_vectorengine
+from utils.llm_agent import chat_with_vectorengine, LLMImageError
 
 load_env()
 
@@ -289,6 +289,32 @@ def build_schedule_heatmap(schedule: dict):
     )
 
     return style_chart(heatmap)
+
+
+def _prepare_chat_image(uploaded, max_side: int = 2000, max_bytes: int = 3_000_000):
+    """Uploaded JPG/PNG -> (bytes, mime) ready to send, or raise ValueError.
+    Fixes phone-photo rotation and shrinks large images; screenshots stay PNG
+    so small text remains sharp unless the file is still too big."""
+    import io
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        img = Image.open(io.BytesIO(uploaded.getvalue()))
+        img.load()
+    except (UnidentifiedImageError, OSError) as e:
+        raise ValueError(f"{uploaded.name} is not a readable JPG or PNG image") from e
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((max_side, max_side))
+
+    is_png = (img.format or "").upper() == "PNG" or uploaded.name.lower().endswith(".png")
+    if is_png:
+        out = io.BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        if out.tell() <= max_bytes:
+            return out.getvalue(), "image/png"
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="JPEG", quality=85)
+    return out.getvalue(), "image/jpeg"
 
 
 def comfort_warning(results: dict, params: dict):
@@ -1210,7 +1236,11 @@ elif page == "results":
 elif page == "assistant":
     params = load_latest_parameters()
     st.header("🤖 Assistant")
-    st.caption("Ask questions about your PV forecast and optimization results. (Uses VectorEngine GPT)")
+    st.caption(
+        "Ask questions about your PV forecast and optimization results. You can also "
+        "attach a screenshot or photo (JPG, JPEG or PNG) with the 📎 button. "
+        "(Uses VectorEngine GPT)"
+    )
 
     if not params:
         st.warning("⚠️ Please complete Setup first.")
@@ -1250,15 +1280,51 @@ elif page == "assistant":
                 if m["role"] == "system":
                     continue
                 with st.chat_message("user" if m["role"] == "user" else "assistant"):
-                    st.markdown(m["content"])
+                    st.markdown(m.get("display", m["content"]))
+                    for img in m.get("images", []):
+                        st.image(img, width=360)
 
-            user_text = st.chat_input(
-                "Ask: Why is PV low at 8am? How can I reduce cost? Should I widen Tmax?"
+            submitted_msg = st.chat_input(
+                "Ask: Why is PV low at 8am? How can I reduce cost? Or attach a screenshot 📎",
+                accept_file="multiple",
+                file_type=["jpg", "jpeg", "png"],
             )
-            if user_text:
+            if submitted_msg:
+                if isinstance(submitted_msg, str):
+                    user_text, files = submitted_msg, []
+                else:
+                    user_text, files = submitted_msg.text or "", list(submitted_msg.files or [])
+
+                max_images = 3
+                if len(files) > max_images:
+                    st.warning(f"Only the first {max_images} images are sent.")
+                    files = files[:max_images]
+                images = []
+                for f in files:
+                    try:
+                        images.append(_prepare_chat_image(f))
+                    except ValueError as e:
+                        st.warning(f"⚠️ Skipped: {e}.")
+
+                if not user_text.strip():
+                    user_text = (
+                        "Please look at the attached image, explain what it shows, "
+                        "and point out anything that looks wrong or unusual."
+                    )
+                # The model sees a note that images were attached, so later
+                # questions about "the screenshot" still make sense.
+                model_text = user_text
+                if images:
+                    model_text += f"\n\n[The user attached {len(images)} image(s) to this message.]"
+
                 st.session_state.assistant_messages.append(
-                    {"role": "user", "content": user_text}
+                    {"role": "user", "content": model_text, "display": user_text,
+                     "images": [data for data, _ in images]}
                 )
+                with st.chat_message("user"):
+                    st.markdown(user_text)
+                    for data, _ in images:
+                        st.image(data, width=360)
 
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
@@ -1267,6 +1333,7 @@ elif page == "assistant":
                                 st.session_state.assistant_messages,
                                 model="gpt-5-mini-2025-08-07",
                                 max_output_tokens=1000,
+                                images=images or None,
                             )
 
                             if answer.strip().startswith("{") and len(answer) > 2000:
@@ -1292,6 +1359,16 @@ elif page == "assistant":
                             ][-max_msgs:]
                             st.session_state.assistant_messages = keep + rest
 
+                        except LLMImageError as e:
+                            # Drop the failed message so the chat history stays clean.
+                            st.session_state.assistant_messages.pop()
+                            st.error(
+                                "The assistant couldn't read the image. Your AI service "
+                                "(VectorEngine) may not support images for this model. "
+                                "Please ask again without the image, or describe the issue in text."
+                            )
+                            with st.expander("Technical details"):
+                                st.code(str(e))
                         except Exception as e:
                             st.error("Assistant call failed.")
                             st.exception(e)

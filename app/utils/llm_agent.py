@@ -1,8 +1,9 @@
 # app/utils/llm_agent.py
 from __future__ import annotations
 
+import base64
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import httpx
 from openai import OpenAI
@@ -10,6 +11,10 @@ from openai import OpenAI
 
 class LLMError(RuntimeError):
     pass
+
+
+class LLMImageError(LLMError):
+    """The request carried images and the model or gateway rejected it."""
 
 
 def _make_client(api_key: str) -> OpenAI:
@@ -56,12 +61,26 @@ def _get_output_text(resp) -> str:
     return ""
 
 
+def _build_input(messages: List[Dict[str, str]], images: Optional[List[Tuple[bytes, str]]]):
+    """Plain text input as before; with images, one user turn holding the
+    conversation text followed by the images (Responses API content parts)."""
+    text = _messages_to_input(messages)
+    if not images:
+        return text
+    content = [{"type": "input_text", "text": text}]
+    for data, mime in images:
+        b64 = base64.b64encode(data).decode("ascii")
+        content.append({"type": "input_image", "image_url": f"data:{mime};base64,{b64}"})
+    return [{"role": "user", "content": content}]
+
+
 def chat_with_vectorengine(
     messages: List[Dict[str, str]],
     model: str = "gpt-5-mini-2025-08-07",
     api_key: Optional[str] = None,
     max_output_tokens: int = 600,
     reasoning_effort: str = "minimal",
+    images: Optional[List[Tuple[bytes, str]]] = None,
 ) -> str:
     """
     VectorEngine + OpenAI SDK compatible Responses API call.
@@ -76,7 +95,9 @@ def chat_with_vectorengine(
         raise LLMError("Missing VECTORENGINE_API_KEY (or OPENAI_API_KEY) in .env")
 
     client = _make_client(key)
-    inp = _messages_to_input(messages)
+    inp = _build_input(messages, images)
+    # Images attached to the latest question are sent with this call only.
+    err_cls = LLMImageError if images else LLMError
 
     # Attempt 1: with reasoning (if supported by your SDK/gateway)
     try:
@@ -93,7 +114,7 @@ def chat_with_vectorengine(
         # reasoning not supported OR signature mismatch -> retry without reasoning
         pass
     except Exception as e:
-        raise LLMError(f"VectorEngine Responses call failed: {type(e).__name__}: {e}")
+        raise err_cls(f"VectorEngine Responses call failed: {type(e).__name__}: {e}")
 
     # Attempt 2: without reasoning
     try:
@@ -103,7 +124,7 @@ def chat_with_vectorengine(
             max_output_tokens=int(max_output_tokens),
         )
     except Exception as e:
-        raise LLMError(f"VectorEngine Responses call failed (no reasoning): {type(e).__name__}: {e}")
+        raise err_cls(f"VectorEngine Responses call failed (no reasoning): {type(e).__name__}: {e}")
 
     text = _get_output_text(resp)
     if not text:
