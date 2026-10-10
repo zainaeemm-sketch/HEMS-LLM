@@ -25,7 +25,7 @@ from forecasting.openweather_pv_forecast import (
 )
 from optimization.hems_optimizer import optimize_schedule
 from community_page import render_community_page
-from utils.llm_agent import chat_with_vectorengine, LLMImageError
+from utils.llm_agent import chat_with_llm, llm_settings, LLMImageError, LLMAuthError
 
 load_env()
 
@@ -1231,23 +1231,26 @@ elif page == "results":
         )
 
 # ============================================================
-# 🤖 ASSISTANT PAGE (VectorEngine chat)
+# 🤖 ASSISTANT PAGE (LLM chat, provider set in secrets)
 # ============================================================
 elif page == "assistant":
     params = load_latest_parameters()
     st.header("🤖 Assistant")
+    llm_cfg = llm_settings()
     st.caption(
         "Ask questions about your PV forecast and optimization results. You can also "
         "attach a screenshot or photo (JPG, JPEG or PNG) with the 📎 button. "
-        "(Uses VectorEngine GPT)"
+        f"(Model: {llm_cfg['model']})"
     )
 
     if not params:
         st.warning("⚠️ Please complete Setup first.")
     else:
-        key_present = bool(get_env("VECTORENGINE_API_KEY") or get_env("OPENAI_API_KEY"))
-        if not key_present:
-            st.error("Missing VECTORENGINE_API_KEY (or OPENAI_API_KEY). Add it to .env.")
+        if not llm_cfg["has_key"]:
+            st.error(
+                "Missing API key. Add OPENAI_API_KEY (plus OPENAI_BASE_URL and LLM_MODEL "
+                "for a non-OpenAI provider) to your Streamlit Secrets or .env."
+            )
         else:
             if "assistant_messages" not in st.session_state:
                 st.session_state.assistant_messages = [
@@ -1329,9 +1332,8 @@ elif page == "assistant":
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         try:
-                            answer = chat_with_vectorengine(
+                            answer = chat_with_llm(
                                 st.session_state.assistant_messages,
-                                model="gpt-5-mini-2025-08-07",
                                 max_output_tokens=1000,
                                 images=images or None,
                             )
@@ -1359,12 +1361,21 @@ elif page == "assistant":
                             ][-max_msgs:]
                             st.session_state.assistant_messages = keep + rest
 
+                        except LLMAuthError as e:
+                            st.session_state.assistant_messages.pop()
+                            st.error(
+                                "The AI provider rejected the API key. Check OPENAI_API_KEY "
+                                "and OPENAI_BASE_URL in your Streamlit Secrets (the key must "
+                                "belong to that provider), then reboot the app."
+                            )
+                            with st.expander("Technical details"):
+                                st.code(str(e))
                         except LLMImageError as e:
                             # Drop the failed message so the chat history stays clean.
                             st.session_state.assistant_messages.pop()
                             st.error(
-                                "The assistant couldn't read the image. Your AI service "
-                                "(VectorEngine) may not support images for this model. "
+                                "The assistant couldn't read the image. Your AI provider "
+                                f"may not support images for the model {llm_cfg['model']}. "
                                 "Please ask again without the image, or describe the issue in text."
                             )
                             with st.expander("Technical details"):
