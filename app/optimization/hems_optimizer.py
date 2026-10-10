@@ -87,8 +87,8 @@ def optimize_schedule(
 
     - Grid exchange split into import/export (kW):
         net = total_load - pv
-        grid_import >= net, grid_import >= 0
-        grid_export >= -net, 0 <= grid_export <= pv
+        grid_import - grid_export = net, both >= 0, grid_export <= pv
+        and never both positive in the same slot (binary switch)
       Cost = sum((import*price - export*feed_in_tariff) * slot_hours)
     - Appliance windows and cycle lengths are honoured to the quarter hour.
     - Optional outdoor temperature profile (T_ext, hourly) for the heating model.
@@ -181,10 +181,18 @@ def optimize_schedule(
 
     grid_import = pulp.LpVariable.dicts("grid_import", slots, lowBound=0)
     grid_export = pulp.LpVariable.dicts("grid_export", slots, lowBound=0)
+    # 1 = buying from the grid in this slot, 0 = selling. Prevents buying and
+    # selling in the same 15 minutes.
+    buying = pulp.LpVariable.dicts("buying", slots, cat="Binary")
+    big_m = max_power + max(pv + [0.0]) + 1.0
 
     for s in slots:
-        prob += grid_import[s] >= net[s]
-        prob += grid_export[s] >= -net[s]
+        # Energy balance: grid import minus grid export equals household
+        # load minus PV. As inequalities this let PV that powered the home
+        # also be counted as exported, overstating export income.
+        prob += grid_import[s] - grid_export[s] == net[s]
+        prob += grid_import[s] <= big_m * buying[s]
+        prob += grid_export[s] <= big_m * (1 - buying[s])
         # Physical cap: you can only export what your PV actually produced.
         # Without this, an inflated feed-in tariff (fit > tou_price) makes
         # grid_export unbounded above and the LP returns "Unbounded".
