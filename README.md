@@ -5,7 +5,7 @@ A Home Energy Management System (HEMS) application built with **Streamlit**, fea
 - Persistent storage using **SQLite**
 - **PV forecasting** using historical PVGIS data and real-time OpenWeather data
 - Cost and comfort **optimization**
-- An **LLM assistant** (VectorEngine / GPT‑5‑mini) for explanations only
+- An **LLM assistant** (any OpenAI-compatible provider) for explanations only
 
 ---
 
@@ -58,12 +58,15 @@ pip install -r requirements.txt
 Create a `.env` file in the **project root directory**:
 
 ```env
-VECTORENGINE_API_KEY=your_vectorengine_key_here
+OPENAI_API_KEY=your_llm_provider_key_here
+OPENAI_BASE_URL=https://api.openai.com/v1   # or your provider's URL
+LLM_MODEL=gpt-5-mini-2025-08-07                # model name at that provider
 OPENWEATHER_API_KEY=your_openweather_key_here
 ```
 
 Notes:
-- `VECTORENGINE_API_KEY` is used only for the **Assistant** page
+- `OPENAI_API_KEY`, `OPENAI_BASE_URL` and `LLM_MODEL` are used only for the **Assistant** page (the app tries the Responses API and falls back to Chat Completions; set `LLM_API_STYLE=chat` to force it). An older `VECTORENGINE_API_KEY` still works
+- On Streamlit Cloud, put these in **Settings → Secrets** instead of `.env`; never commit keys to the repo
 - `OPENWEATHER_API_KEY` is used for **real-time PV forecasting**
 - API keys are **never stored** in SQLite
 
@@ -138,7 +141,7 @@ Two forecasting modes are supported:
 ---
 
 ### 🤖 Assistant
-- Powered by **VectorEngine GPT‑5‑mini**
+- Powered by the model set in `LLM_MODEL`
 - Explains forecasts and optimization results
 - Provides insights and recommendations
 - Read-only: never modifies configuration or results
