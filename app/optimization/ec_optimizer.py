@@ -819,6 +819,20 @@ def run_ec_game(users: list[UserProfile] | None = None,
         shared.append(float(np.sum(np.minimum(prof_ec_ttl[r], gensolar + e))))
     shared0 = float(np.sum(np.minimum(prof_ec_ttl[0], gensolar)))
 
+    # -------- "before optimization" cost of each household --------------
+    # Each household's original schedule, evaluated with the same objective
+    # but no coordination and an idle battery (the round-0 baseline).
+    agg0 = prof0.sum(axis=0)
+    fval0 = []
+    for uix, u in enumerate(users):
+        enc = _encode_user(u)
+        ind = _individual_from_profile(u, enc)
+        fval0.append(_ec_cost_user(
+            _decode(ind, enc), ind["a"],
+            gensolar=gensolar, pess=np.zeros(H),
+            prof_ec_others=agg0 - prof0[uix], crit=crit[uix],
+            prof_total_user=u.total, p=p, n4=enc.n4))
+
     # -------- keep-best memory (Saber's rule) ---------------------------
     # The game terminates on the Nash condition (no household can improve
     # its OWN cost), but the community-level optimum may occur in an
@@ -847,6 +861,7 @@ def run_ec_game(users: list[UserProfile] | None = None,
         "fval": fval.tolist(),
         "fval_ess": fval_ess,
         "shared_energy_initial": shared0,
+        "fval_initial": [float(v) for v in fval0],
         "shared_energy_by_round": shared,
         "n_users": p.n_users,
         "rounds": n_rounds_run,
