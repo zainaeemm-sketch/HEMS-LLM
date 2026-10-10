@@ -142,8 +142,11 @@ def optimize_schedule(
         str(name).strip().lower() == "heating" for name in appliances
     )
 
+    # Heater capacity (kW) from Setup; 2 kW was the fixed value before.
+    heater_kw = max(0.1, safe_float(params.get("heater_power_kw"), 2.0))
+
     if heating_in_use:
-        heating_power = pulp.LpVariable.dicts("heating", slots, lowBound=0, upBound=2.0)
+        heating_power = pulp.LpVariable.dicts("heating", slots, lowBound=0, upBound=heater_kw)
     else:
         # Dummy: zero contribution to load, no decision variable.
         heating_power = {s: 0.0 for s in slots}
@@ -261,13 +264,14 @@ def optimize_schedule(
     # Hard min/max on T make the LP infeasible whenever heating capacity
     # can't beat outdoor heat loss. Soft bounds use slack variables so
     # violations are allowed but penalized in the objective.
+    alpha, beta = 0.10, 0.05  # °C per kWh of heat; heat-loss rate per hour
+    comfort_penalty = 10.0    # $/°C-hour of comfort violation (internal weight)
     if heating_in_use:
         T = pulp.LpVariable.dicts("T", slots)  # unbounded
         T_under = pulp.LpVariable.dicts("T_under", slots, lowBound=0)
         T_over = pulp.LpVariable.dicts("T_over", slots, lowBound=0)
 
         # Hourly rate coefficients, scaled to the 15-minute step.
-        alpha, beta = 0.10, 0.05
         prob += T[0] == 20.0
         for s in range(1, N_SLOTS):
             prob += T[s] == T[s - 1] + DT * (
@@ -280,7 +284,6 @@ def optimize_schedule(
             prob += T[s] <= Tmax + T_over[s]
 
         # Comfort-violation penalty, in $/°C-hour of violation.
-        comfort_penalty = 10.0
         prob.objective += comfort_penalty * DT * pulp.lpSum(
             T_under[s] + T_over[s] for s in slots
         )
@@ -304,7 +307,15 @@ def optimize_schedule(
     else:
         # No heating model — indoor temp stays at the initial 20°C placeholder.
         temps_15 = [20.0] * N_SLOTS
-    cost = _val(prob.objective)
+    objective = _val(prob.objective)
+    # Comfort shortfall in °C-hours: how far, and for how long, the room was
+    # outside [Tmin, Tmax]. Reported separately so it isn't mistaken for money.
+    if heating_in_use:
+        shortfall = DT * sum(_val(T_under[s]) + _val(T_over[s]) for s in slots)
+    else:
+        shortfall = 0.0
+    penalty = comfort_penalty * shortfall
+    cost = objective - penalty  # the real energy bill
 
     gi_15 = [_val(grid_import[s]) for s in slots]
     ge_15 = [_val(grid_export[s]) for s in slots]
@@ -329,7 +340,14 @@ def optimize_schedule(
             for app, vals in schedule_15.items() if app != "Heating"
         },
         "T_ext": T_ext,
-        "cost": cost,
+        "cost": cost,                      # energy bill only
+        "objective": objective,            # bill + comfort penalty (what the solver minimises)
+        "comfort_penalty": penalty,
+        "comfort_shortfall_ch": shortfall,  # °C-hours outside the comfort band
+        "heater_power_kw": heater_kw if heating_in_use else None,
+        # Warmest the heater can hold the house above outdoor in steady state,
+        # limited by the contracted power as well as the heater rating.
+        "heating_max_rise_c": (alpha / beta) * min(heater_kw, max_power) if heating_in_use else None,
         "status": status_text,
         "status_code": status_code,
     }

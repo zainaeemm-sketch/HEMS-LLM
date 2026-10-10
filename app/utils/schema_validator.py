@@ -71,6 +71,7 @@ class HEMSParameters(BaseModel):
     Tmin: float
     Tmax: float
     max_power: Optional[float] = None
+    heater_power_kw: Optional[float] = 2.0  # used only when "Heating" is an appliance
     do_not_disturb: Optional[List[str]] = Field(default_factory=list)
     solar_pv_capacity: Optional[float] = 0.0
     pv_forecast: Optional[List[float]] = Field(default_factory=list)
@@ -91,6 +92,18 @@ class HEMSParameters(BaseModel):
         if "Tmin" in values and v <= values["Tmin"]:
             raise ValueError("Tmax must be greater than Tmin")
         return v
+
+    @validator("heater_power_kw", pre=True)
+    def validate_heater_power(cls, v):
+        if v in (None, ""):
+            return 2.0
+        try:
+            kw = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("heater_power_kw must be a number of kW")
+        if not (0.1 <= kw <= 100):
+            raise ValueError("heater_power_kw must be between 0.1 and 100 kW")
+        return kw
 
     @validator("appliances")
     def validate_appliances(cls, v):
