@@ -177,6 +177,9 @@ def style_chart(chart):
             labelFontSize=12,
             titleFontSize=13,
         )
+        # Streamlit's theme pins the first and last time labels to the axis
+        # edges, which pushed "00:00" into "01:00". Centre every label instead.
+        .configure_axisX(labelFlush=False)
         .configure_title(
             anchor="start",
             color="#0f172a",
