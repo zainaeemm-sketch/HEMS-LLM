@@ -352,6 +352,29 @@ def render_community_page(params: dict | None = None):
         st.subheader("Shared battery")
         st.caption(f"Battery schedule of the recommended solution (round {best_r}); "
                    "＋ = discharge, − = charge.")
+        if np.all(np.abs(pess) < 1e-3):
+            # Explain an idle battery instead of leaving an empty chart.
+            # The battery for round r is planned on the community profile at
+            # the start of that round, so check surplus against that profile.
+            plan_idx = min(max(int(best_r) - 1, 0), len(prof_ttl) - 1)
+            surplus_hours = int(np.sum(gensolar > prof_ttl[plan_idx] + 1e-6))
+            if surplus_hours == 0:
+                st.info(
+                    "🔋 **Battery idle:** solar never exceeds the community's demand "
+                    "in any hour, so there is no spare solar to store. The battery may "
+                    "only charge from surplus solar, and it must end the day at least "
+                    "as full as it started. To see it work, add generation (e.g. raise "
+                    "the PV scale factor) or use fewer households."
+                )
+            else:
+                wear = float(results["params"].get("c_ess", 0.0))
+                st.info(
+                    f"🔋 **Battery idle:** there is spare solar in {surplus_hours} "
+                    f"hour(s), but storing it would cost more in battery wear "
+                    f"(€{wear:.3f} per kWh moved) than it would earn. A larger, cheaper "
+                    "or longer-lasting battery, or more generation, can make it "
+                    "worthwhile."
+                )
         bdf = pd.DataFrame({
             "hour": np.arange(24),
             "power (kW)": pess,           # >0 discharge, <0 charge
