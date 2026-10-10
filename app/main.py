@@ -291,6 +291,41 @@ def build_schedule_heatmap(schedule: dict):
     return style_chart(heatmap)
 
 
+def comfort_warning(results: dict, params: dict):
+    """Markdown warning when heating couldn't keep the room in the comfort band, else None."""
+    if "Heating" not in (results.get("schedule") or {}):
+        return None
+    tmin = safe_float(params.get("Tmin"), 18.0)
+    tmax = safe_float(params.get("Tmax"), 22.0)
+    temps = results.get("temps_15min")
+    step_h = 0.25
+    if not temps:  # results saved before the 15-minute optimizer
+        temps, step_h = results.get("temps") or [], 1.0
+    too_cold = step_h * sum(max(0.0, tmin - safe_float(t, tmin)) for t in temps)
+    too_warm = step_h * sum(max(0.0, safe_float(t, tmax) - tmax) for t in temps)
+    if too_cold < 0.05 and too_warm < 0.05:
+        return None
+    lines = [
+        f"🌡️ **Comfort not fully met.** The room was outside your {tmin:g}–{tmax:g} °C band "
+        f"by **{too_cold + too_warm:.1f} °C·h** in total (e.g. 2 °C too cold for 3 hours = 6 °C·h). "
+        "This is shown separately and is not part of the cost."
+    ]
+    if too_cold >= 0.05:
+        heater = results.get("heater_power_kw")
+        rise = results.get("heating_max_rise_c")
+        if heater and rise:
+            limit = min(heater, safe_float(params.get("max_power"), heater))
+            capped = " (limited by your Max Power)" if limit < heater else ""
+            lines.append(
+                f"Your heater ({heater:g} kW{capped}) can keep the house at most "
+                f"**{rise:.1f} °C warmer than outdoors**. Raise **Heater Power** on the Setup "
+                "page or lower Tmin to stay comfortable on cold days."
+            )
+    if too_warm >= 0.05:
+        lines.append("The room also got warmer than Tmax; heating can't cool it down.")
+    return " ".join(lines)
+
+
 def build_temperature_chart(results: dict, params: dict):
     time_labels = _hour_labels()
     indoor = (results.get("temps") or [0] * 24)[:24]
@@ -515,7 +550,10 @@ def _summarize_for_assistant(params: dict) -> dict:
     opt_summary = {}
     if isinstance(opt, dict) and opt:
         opt_summary = {
-            "cost": opt.get("cost"),
+            "cost": opt.get("cost"),  # energy bill only
+            "comfort_shortfall_degC_hours": opt.get("comfort_shortfall_ch"),
+            "heater_power_kw": opt.get("heater_power_kw"),
+            "heating_max_rise_above_outdoor_c": opt.get("heating_max_rise_c"),
             "grid_import": opt.get("grid_import"),
             "grid_export": opt.get("grid_export"),
             "temps": opt.get("temps"),
@@ -663,6 +701,7 @@ if page == "setup":
     default_Tmin = safe_float(params.get("Tmin"), 18.0)
     default_Tmax = safe_float(params.get("Tmax"), 22.0)
     default_max_power = safe_float(params.get("max_power"), 5.0)
+    default_heater_kw = safe_float(params.get("heater_power_kw"), 2.0)
     default_pv_cap = safe_float(params.get("solar_pv_capacity"), 0.0)
 
     raw_dnd = params.get("do_not_disturb", [])
@@ -698,6 +737,12 @@ if page == "setup":
             Tmin = st.number_input("Tmin (°C)", 0.0, 60.0, default_Tmin)
             Tmax = st.number_input("Tmax (°C)", 0.0, 60.0, default_Tmax)
             max_power = st.number_input("Max Power (kW)", 0.0, 10000.0, default_max_power)
+            heater_power_kw = st.number_input(
+                "Heater Power (kW)", 0.1, 100.0, default_heater_kw, 0.5,
+                help="Maximum power of the heating system. Used only when 'Heating' "
+                     "is in the appliance list. A weak heater can't keep the house in "
+                     "the comfort band on cold days.",
+            )
 
         st.subheader("⚙️ Appliances")
         st.caption(
@@ -754,6 +799,7 @@ if page == "setup":
             "Tmin": float(Tmin),
             "Tmax": float(Tmax),
             "max_power": float(max_power),
+            "heater_power_kw": float(heater_power_kw),
             "do_not_disturb": dnd_list,
             "solar_pv_capacity": float(solar_pv_capacity),
             "pv_forecast": params.get("pv_forecast", []),
@@ -987,7 +1033,10 @@ elif page == "optimize":
             slot_min = int(results.get("slot_minutes") or 60)
 
             if status == "Optimal":
-                st.success(f"✅ Optimization complete (solver: {status}). Total cost: ${cost:.2f}")
+                st.success(f"✅ Optimization complete (solver: {status}). Energy cost: ${cost:.2f}")
+                warn = comfort_warning(results, params)
+                if warn:
+                    st.warning(warn)
             elif status == "Infeasible":
                 st.error(
                     f"❌ Solver returned **Infeasible** — no feasible schedule exists "
@@ -1122,7 +1171,11 @@ elif page == "results":
         total_pv = sum(pv_forecast[:24]) if pv_forecast else 0.0
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Cost", f"${total_cost:.2f}")
+        c1.metric(
+            "Total Cost", f"${total_cost:.2f}",
+            help="Your energy bill: grid purchases minus export income. Comfort "
+                 "shortfall (if any) is reported separately, not included here.",
+        )
         c2.metric("Peak Import", f"{peak_import:.2f} kW")
         c3.metric("Import Energy", f"{total_import:.2f} kWh")
         c4.metric("Export Energy", f"{total_export:.2f} kWh")
@@ -1137,6 +1190,9 @@ elif page == "results":
         # Only show thermal chart if Heating was actually part of the optimization.
         if "Heating" in (results.get("schedule") or {}):
             st.markdown("### Thermal Comfort")
+            warn = comfort_warning(results, params)
+            if warn:
+                st.warning(warn)
             st.altair_chart(
                 build_temperature_chart(results, params),
                 use_container_width=True,
