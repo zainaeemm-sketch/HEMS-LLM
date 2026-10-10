@@ -303,28 +303,46 @@ def render_community_page(params: dict | None = None):
 
     # ---- convergence across rounds ----
     st.subheader("Convergence of the game")
+    # Round 0 = before optimization (original schedules, battery idle), so the
+    # step from the starting point to the first round is visible.
+    fval0 = results.get("fval_initial")
     conv = pd.DataFrame({
-        "round": list(range(1, R + 1)),
-        "shared energy (kWh)": results["shared_energy_by_round"],
-        "mean user cost (€)": [float(np.mean(r)) for r in results["fval"]],
+        "round": list(range(0, R + 1)),
+        "shared energy (kWh)":
+            [results["shared_energy_initial"]] + list(results["shared_energy_by_round"]),
+        "mean user cost (€)":
+            [float(np.mean(fval0)) if fval0 else None]
+            + [float(np.mean(r)) for r in results["fval"]],
         "households that changed schedule":
-            results.get("changes_per_round", [None] * R),
+            [None] + list(results.get("changes_per_round", [None] * R)),
     })
     st.caption("Households changing schedule per round: "
                + " → ".join(str(c) for c in results.get("changes_per_round", []))
-               + "  (equilibrium = a round with 0 changes)")
+               + "  (equilibrium = a round with 0 changes). "
+               + "Round 0 shows the community before optimization.")
+    round_axis = alt.X(
+        "round:O", title="round",
+        axis=alt.Axis(labelAngle=0,
+                      labelExpr="datum.value == 0 ? 'before' : datum.label"),
+    )
+    tooltip = [
+        alt.Tooltip("round:O", title="round (0 = before)"),
+        alt.Tooltip("shared energy (kWh):Q", format=".1f"),
+        alt.Tooltip("mean user cost (€):Q", format=".2f"),
+        alt.Tooltip("households that changed schedule:Q"),
+    ]
     cc1, cc2 = st.columns(2)
     with cc1:
         st.altair_chart(
             alt.Chart(conv).mark_line(point=True).encode(
-                x="round:O", y=alt.Y("shared energy (kWh):Q")
+                x=round_axis, y=alt.Y("shared energy (kWh):Q"), tooltip=tooltip
             ).properties(height=240),
             use_container_width=True,
         )
     with cc2:
         st.altair_chart(
             alt.Chart(conv).mark_line(point=True, color="#e45756").encode(
-                x="round:O", y=alt.Y("mean user cost (€):Q")
+                x=round_axis, y=alt.Y("mean user cost (€):Q"), tooltip=tooltip
             ).properties(height=240),
             use_container_width=True,
         )
